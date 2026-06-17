@@ -6,6 +6,10 @@
   background: var(--bg);
 }
 
+.app-shell.pdf-focused {
+  grid-template-columns: 220px minmax(420px, 0.7fr) minmax(460px, 1fr);
+}
+
 .sidebar,
 .workspace,
 .pdf-pane {
@@ -118,14 +122,19 @@ kbd {
 .nav-item {
   min-height: 34px;
   padding: 0 9px;
+  border: 0;
   border-radius: 7px;
   color: var(--text);
+  background: transparent;
   text-decoration: none;
 }
 
 .nav-item.active,
 .nav-item:hover,
-.paper-row.selected {
+.paper-row.selected,
+.skill-row.selected,
+.command-button.active,
+.icon-button.active {
   color: var(--text-strong);
   background: var(--surface-soft);
 }
@@ -253,6 +262,40 @@ kbd {
   font-weight: 700;
 }
 
+.command-panel {
+  display: grid;
+  gap: 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 14px;
+  background: var(--surface);
+}
+
+.command-list {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.command-list button {
+  min-height: 36px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  color: var(--text);
+  background: var(--surface-soft);
+}
+
+.command-list button:hover,
+.source-row button:hover,
+.paper-row:hover,
+.skill-row:hover,
+.icon-button:hover,
+.pdf-footer button:hover,
+.query-input button:hover {
+  color: var(--text-strong);
+  border-color: var(--accent-border);
+}
+
 .answer-panel {
   display: grid;
   align-content: start;
@@ -275,6 +318,20 @@ kbd {
   display: flex;
   gap: 8px;
   flex-wrap: wrap;
+}
+
+.source-row button.selected {
+  color: var(--text-strong);
+  border-color: var(--accent-border);
+  background: var(--accent-soft);
+}
+
+.message-line {
+  border-left: 3px solid rgba(61, 189, 199, 0.72);
+  padding: 8px 10px;
+  color: var(--text-strong);
+  background: rgba(61, 189, 199, 0.08);
+  font-size: 13px;
 }
 
 .task-board {
@@ -325,6 +382,8 @@ kbd {
   color: #25313d;
   background: #f7f2e8;
   box-shadow: 0 24px 80px rgba(0, 0, 0, 0.35);
+  transform-origin: center top;
+  transition: transform 160ms ease;
 }
 
 .page-meta {
