@@ -1,7 +1,8 @@
 .app-shell {
   display: grid;
   grid-template-columns: 292px minmax(360px, 1fr) 8px var(--pdf-pane-width, 520px);
-  min-height: 100vh;
+  height: 100vh;
+  min-height: 0;
   overflow: hidden;
   background: var(--bg);
 }
@@ -17,13 +18,15 @@
 
 .sidebar,
 .workspace {
-  min-height: 100vh;
+  height: 100vh;
+  min-height: 0;
   overflow: auto;
 }
 
 .pdf-pane,
 .pdf-resize-handle {
-  min-height: 100vh;
+  height: 100vh;
+  min-height: 0;
 }
 
 .sidebar {
@@ -276,7 +279,7 @@ kbd {
 
 .workspace {
   display: grid;
-  grid-template-rows: auto auto 1fr auto;
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
   gap: 16px;
   min-width: 0;
   padding: 18px;
@@ -381,6 +384,8 @@ kbd {
   display: grid;
   align-content: start;
   gap: 14px;
+  min-height: 0;
+  overflow: auto;
   padding: 16px;
 }
 
@@ -474,7 +479,7 @@ kbd {
 
 .pdf-pane {
   display: grid;
-  grid-template-rows: auto 1fr auto;
+  grid-template-rows: auto minmax(0, 1fr) auto;
   min-width: 0;
   overflow: hidden;
   border-left: 1px solid var(--border);
@@ -526,18 +531,19 @@ kbd {
 }
 
 .pdf-stage {
+  height: 100%;
   min-height: 0;
   padding: 22px;
   overflow: auto;
+  overscroll-behavior: contain;
 }
 
 .pdf-document {
   display: grid;
-  width: max-content;
-  min-width: 100%;
+  width: 100%;
+  min-width: 0;
   justify-items: center;
   gap: 18px;
-  margin: 0 auto;
 }
 
 .pdf-page-shell {
@@ -549,7 +555,7 @@ kbd {
 
 .pdf-canvas {
   display: block;
-  max-width: none;
+  max-width: 100%;
   border-radius: 3px;
   background: #f7f2e8;
   box-shadow: 0 24px 80px rgba(0, 0, 0, 0.35);

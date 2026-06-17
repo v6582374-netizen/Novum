@@ -29,13 +29,16 @@
 
 #root {
   min-width: 1180px;
-  min-height: 100vh;
+  height: 100vh;
+  min-height: 0;
+  overflow: hidden;
 }
 
 body {
   margin: 0;
   min-width: 1180px;
-  min-height: 100vh;
+  height: 100vh;
+  min-height: 0;
   overflow: hidden;
 }
 

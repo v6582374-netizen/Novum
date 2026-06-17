@@ -239,7 +239,14 @@ function App() {
     window.requestAnimationFrame(() => {
       const stage = pdfStageRef.current
       const target = stage?.querySelector<HTMLElement>(`[data-page="${page}"]`)
-      target?.scrollIntoView({ block: 'start', behavior })
+      if (!stage || !target) return
+
+      const stageRect = stage.getBoundingClientRect()
+      const targetRect = target.getBoundingClientRect()
+      stage.scrollTo({
+        top: stage.scrollTop + targetRect.top - stageRect.top,
+        behavior,
+      })
     })
   }, [])
 
@@ -288,7 +295,7 @@ function App() {
     const nextPage = clamp(document.lastOpenedPage || 1, 1, document.pageCount)
     setCurrentPage(nextPage)
     setSelectedCitationPage(nextPage)
-    setZoom(clamp(document.lastZoom || 100, 60, 180))
+    setZoom(clamp(document.lastZoom || 100, 60, 100))
   }, [])
 
   const loadDocuments = useCallback(async (preferredDocumentId?: string | null) => {
@@ -525,7 +532,7 @@ function App() {
 
   function adjustZoom(delta: number) {
     setZoom((current) => {
-      const next = clamp(current + delta, 60, 180)
+      const next = clamp(current + delta, 60, 100)
       setMessage(`PDF 缩放已调整为 ${next}%。`)
       return next
     })
@@ -924,7 +931,7 @@ function App() {
               type="button"
               title="缩小"
               onClick={() => adjustZoom(-10)}
-              disabled={!selectedDocument}
+              disabled={!selectedDocument || zoom <= 60}
             >
               <ZoomOut size={15} aria-hidden="true" />
             </button>
@@ -933,7 +940,7 @@ function App() {
               type="button"
               title="放大"
               onClick={() => adjustZoom(10)}
-              disabled={!selectedDocument}
+              disabled={!selectedDocument || zoom >= 100}
             >
               <ZoomIn size={15} aria-hidden="true" />
             </button>
