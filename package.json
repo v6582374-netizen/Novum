@@ -1,0 +1,12 @@
+{
+  "name": "novum",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Desktop research IDE for long-term scientific work.",
+  "scripts": {
+    "desktop:dev": "npm --prefix apps/desktop run dev",
+    "desktop:build": "npm --prefix apps/desktop run build",
+    "desktop:lint": "npm --prefix apps/desktop run lint",
+    "desktop:tauri": "npm --prefix apps/desktop run tauri:dev"
+  }
+}
