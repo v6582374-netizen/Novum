@@ -137,6 +137,7 @@ kbd {
 .nav-item.active,
 .nav-item:hover,
 .paper-row.selected,
+.paper-item.selected .row-delete-button,
 .skill-row.selected,
 .command-button.active,
 .icon-button.active {
@@ -175,6 +176,43 @@ kbd {
   gap: 7px;
 }
 
+.library-search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 34px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0 9px;
+  color: var(--text-muted);
+  background: var(--surface);
+}
+
+.library-search:focus-within {
+  border-color: var(--accent-border);
+  color: var(--text-strong);
+}
+
+.library-search input {
+  width: 100%;
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  color: var(--text-strong);
+  background: transparent;
+  font: inherit;
+}
+
+.library-search input::placeholder {
+  color: var(--text-muted);
+}
+
+.paper-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 34px;
+  gap: 6px;
+}
+
 .paper-row,
 .skill-row {
   width: 100%;
@@ -209,6 +247,22 @@ kbd {
 
 .skill-row {
   justify-content: space-between;
+}
+
+.row-delete-button {
+  display: grid;
+  min-height: 100%;
+  place-items: center;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text-muted);
+  background: var(--surface);
+}
+
+.row-delete-button:hover {
+  color: #fecaca;
+  border-color: rgba(239, 68, 68, 0.46);
+  background: rgba(239, 68, 68, 0.1);
 }
 
 .workspace {
@@ -306,6 +360,7 @@ kbd {
 .paper-row:disabled:hover,
 .skill-row:disabled:hover,
 .icon-button:disabled:hover,
+.row-delete-button:disabled:hover,
 .pdf-footer button:disabled:hover,
 .query-input button:disabled:hover {
   color: inherit;

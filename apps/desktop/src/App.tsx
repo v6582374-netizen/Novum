@@ -98,11 +98,18 @@ function uniquePages(pages: number[], pageCount: number) {
   )
 }
 
+function cleanupPdfDocument(document: PDFDocumentProxy | null) {
+  void document?.cleanup()
+}
+
 function App() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
+  const selectedDocumentIdRef = useRef<string | null>(null)
+  const renderTaskRef = useRef<{ cancel: () => void } | null>(null)
   const [activePanel, setActivePanel] = useState<PanelId>('library')
   const [documents, setDocuments] = useState<DocumentRecord[]>([])
   const [selectedDocumentId, setSelectedDocumentId] = useState<string | null>(null)
+  const [documentQuery, setDocumentQuery] = useState('')
   const [selectedSkillIndex, setSelectedSkillIndex] = useState(0)
   const [currentPage, setCurrentPage] = useState(1)
   const [zoom, setZoom] = useState(100)
@@ -122,6 +129,10 @@ function App() {
   )
   const selectedSkill = skills[selectedSkillIndex]
 
+  useEffect(() => {
+    selectedDocumentIdRef.current = selectedDocumentId
+  }, [selectedDocumentId])
+
   const panelTitle = useMemo(() => {
     if (activePanel === 'library') return '文献库'
     if (activePanel === 'qa') return '论文问答'
@@ -137,18 +148,50 @@ function App() {
     )
   }, [currentPage, selectedDocument])
 
-  const loadDocuments = useCallback(async () => {
+  const filteredDocuments = useMemo(() => {
+    const query = documentQuery.trim().toLocaleLowerCase()
+    if (!query) return documents
+
+    return documents.filter((document) => {
+      const searchableText = [
+        document.title,
+        document.fileName,
+        document.status,
+        `${document.pageCount}`,
+      ]
+        .join(' ')
+        .toLocaleLowerCase()
+
+      return searchableText.includes(query)
+    })
+  }, [documentQuery, documents])
+
+  const selectDocumentState = useCallback((document: DocumentRecord | null) => {
+    setSelectedDocumentId(document?.id ?? null)
+    if (!document) {
+      setCurrentPage(1)
+      setSelectedCitationPage(1)
+      setZoom(100)
+      return
+    }
+
+    const nextPage = clamp(document.lastOpenedPage || 1, 1, document.pageCount)
+    setCurrentPage(nextPage)
+    setSelectedCitationPage(nextPage)
+    setZoom(clamp(document.lastZoom || 100, 60, 180))
+  }, [])
+
+  const loadDocuments = useCallback(async (preferredDocumentId?: string | null) => {
     setIsLoadingLibrary(true)
     setError(null)
     try {
       const library = await invoke<DocumentRecord[]>('list_documents')
+      const targetId = preferredDocumentId ?? selectedDocumentIdRef.current
+      const nextDocument =
+        library.find((document) => document.id === targetId) ?? library[0] ?? null
+
       setDocuments(library)
-      setSelectedDocumentId((current) => {
-        if (current && library.some((document) => document.id === current)) {
-          return current
-        }
-        return library[0]?.id ?? null
-      })
+      selectDocumentState(nextDocument)
       setMessage(library.length ? '已载入本地文献库。' : '文献库为空，请先导入 PDF。')
     } catch (reason) {
       setError(String(reason))
@@ -156,20 +199,22 @@ function App() {
     } finally {
       setIsLoadingLibrary(false)
     }
-  }, [])
+  }, [selectDocumentState])
 
   useEffect(() => {
-    void Promise.resolve().then(loadDocuments)
+    void Promise.resolve().then(() => loadDocuments())
   }, [loadDocuments])
 
   useEffect(() => {
     let cancelled = false
+    let loadingTask: ReturnType<typeof pdfjsLib.getDocument> | null = null
 
     async function loadPdf() {
-      if (!selectedDocument) {
-        setPdfDocument(null)
-        setCurrentPage(1)
-        setZoom(100)
+      if (!selectedDocumentId) {
+        setPdfDocument((previous) => {
+          cleanupPdfDocument(previous)
+          return null
+        })
         return
       }
 
@@ -177,28 +222,34 @@ function App() {
       setError(null)
       try {
         const payload = await invoke<PdfBytes>('get_document_pdf_bytes', {
-          id: selectedDocument.id,
+          id: selectedDocumentId,
         })
         if (cancelled) return
 
-        const loadingTask = pdfjsLib.getDocument({
+        loadingTask = pdfjsLib.getDocument({
           data: Uint8Array.from(payload.bytes),
         })
         const loadedPdf = await loadingTask.promise
         if (cancelled) {
+          cleanupPdfDocument(loadedPdf)
           return
         }
 
-        setPdfDocument(loadedPdf)
-        setCurrentPage(clamp(selectedDocument.lastOpenedPage || 1, 1, loadedPdf.numPages))
-        setSelectedCitationPage(
-          clamp(selectedDocument.lastOpenedPage || 1, 1, loadedPdf.numPages),
-        )
-        setZoom(clamp(selectedDocument.lastZoom || 100, 60, 180))
+        setPdfDocument((previous) => {
+          if (previous !== loadedPdf) {
+            cleanupPdfDocument(previous)
+          }
+          return loadedPdf
+        })
       } catch (reason) {
-        setError(String(reason))
-        setPdfDocument(null)
-        setMessage('加载 PDF 失败。')
+        if (!cancelled) {
+          setError(String(reason))
+          setPdfDocument((previous) => {
+            cleanupPdfDocument(previous)
+            return null
+          })
+          setMessage('加载 PDF 失败。')
+        }
       } finally {
         if (!cancelled) {
           setIsLoadingPdf(false)
@@ -209,15 +260,19 @@ function App() {
     void loadPdf()
     return () => {
       cancelled = true
+      void loadingTask?.destroy()
+      renderTaskRef.current?.cancel()
     }
-  }, [selectedDocument])
+  }, [selectedDocumentId])
 
   useEffect(() => {
     let cancelled = false
+    let renderTask: { promise: Promise<unknown>; cancel: () => void } | null = null
 
     async function renderPage() {
       if (!pdfDocument || !canvasRef.current) return
 
+      renderTaskRef.current?.cancel()
       const page = await pdfDocument.getPage(currentPage)
       if (cancelled || !canvasRef.current) return
 
@@ -233,27 +288,39 @@ function App() {
       canvas.style.height = `${viewport.height}px`
 
       context.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0)
-      await page.render({ canvas, canvasContext: context, viewport }).promise
+      renderTask = page.render({ canvas, canvasContext: context, viewport })
+      renderTaskRef.current = renderTask
+      await renderTask.promise
+
+      if (renderTaskRef.current === renderTask) {
+        renderTaskRef.current = null
+      }
     }
 
     void renderPage().catch((reason) => {
+      const message = String(reason)
+      if (message.includes('RenderingCancelledException')) return
       if (!cancelled) {
-        setError(String(reason))
+        setError(message)
         setMessage('渲染 PDF 页面失败。')
       }
     })
 
     return () => {
       cancelled = true
+      renderTask?.cancel()
+      if (renderTaskRef.current === renderTask) {
+        renderTaskRef.current = null
+      }
     }
   }, [currentPage, pdfDocument, zoom])
 
   useEffect(() => {
-    if (!selectedDocument) return
+    if (!selectedDocumentId) return
 
     const timeout = window.setTimeout(() => {
       invoke<DocumentRecord>('update_reading_state', {
-        id: selectedDocument.id,
+        id: selectedDocumentId,
         page: currentPage,
         zoom,
       })
@@ -268,7 +335,7 @@ function App() {
     }, 350)
 
     return () => window.clearTimeout(timeout)
-  }, [currentPage, selectedDocument, zoom])
+  }, [currentPage, selectedDocumentId, zoom])
 
   function selectPanel(panel: PanelId) {
     setActivePanel(panel)
@@ -277,8 +344,7 @@ function App() {
   }
 
   function selectDocument(document: DocumentRecord) {
-    setSelectedDocumentId(document.id)
-    setSelectedCitationPage(document.lastOpenedPage || 1)
+    selectDocumentState(document)
     setActivePanel('library')
     setMessage(`已打开文献「${document.title}」。`)
   }
@@ -300,8 +366,7 @@ function App() {
       const imported = await invoke<DocumentRecord>('import_pdf_from_path', {
         path: selected,
       })
-      await loadDocuments()
-      setSelectedDocumentId(imported.id)
+      await loadDocuments(imported.id)
       setActivePanel('library')
       setMessage(`已导入文献「${imported.title}」。`)
     } catch (reason) {
@@ -312,20 +377,36 @@ function App() {
     }
   }
 
-  async function deleteSelectedDocument() {
-    if (!selectedDocument) return
+  async function deleteDocument(document: DocumentRecord) {
+    const confirmed = window.confirm(`确定要删除「${document.title}」吗？此操作会移除本地 PDF 副本。`)
+    if (!confirmed) return
 
     setError(null)
     try {
-      await invoke<boolean>('delete_document', { id: selectedDocument.id })
-      setMessage(`已删除文献「${selectedDocument.title}」。`)
-      setPdfDocument(null)
-      setSelectedDocumentId(null)
-      await loadDocuments()
+      await invoke<boolean>('delete_document', { id: document.id })
+      const remainingDocuments = documents.filter((item) => item.id !== document.id)
+      const currentIndex = documents.findIndex((item) => item.id === document.id)
+      const nextDocument =
+        remainingDocuments[currentIndex] ?? remainingDocuments[currentIndex - 1] ?? null
+
+      if (document.id === selectedDocumentId) {
+        setPdfDocument((previous) => {
+          cleanupPdfDocument(previous)
+          return null
+        })
+      }
+
+      await loadDocuments(nextDocument?.id ?? null)
+      setMessage(`已删除文献「${document.title}」。`)
     } catch (reason) {
       setError(String(reason))
       setMessage('删除文献失败。')
     }
+  }
+
+  async function deleteSelectedDocument() {
+    if (!selectedDocument) return
+    await deleteDocument(selectedDocument)
   }
 
   function runPaperQa() {
@@ -424,29 +505,59 @@ function App() {
             </button>
           </div>
 
+          <label className="library-search">
+            <Search size={14} aria-hidden="true" />
+            <input
+              type="search"
+              value={documentQuery}
+              placeholder="查找标题、文件名或状态"
+              aria-label="查找文献"
+              onChange={(event) => setDocumentQuery(event.target.value)}
+            />
+          </label>
+
           <div className="paper-list">
             {isLoadingLibrary ? (
               <div className="empty-state compact">正在读取文献库...</div>
             ) : documents.length ? (
-              documents.map((document) => (
-                <button
-                  className={`paper-row ${
-                    document.id === selectedDocumentId ? 'selected' : ''
-                  }`}
-                  key={document.id}
-                  type="button"
-                  onClick={() => selectDocument(document)}
-                >
-                  <BookOpen size={15} aria-hidden="true" />
-                  <span>
-                    <strong>{document.title}</strong>
-                    <small>
-                      {document.pageCount} 页 | {document.status} | 第{' '}
-                      {document.lastOpenedPage} 页
-                    </small>
-                  </span>
-                </button>
-              ))
+              filteredDocuments.length ? (
+                filteredDocuments.map((document) => (
+                  <div
+                    className={`paper-item ${
+                      document.id === selectedDocumentId ? 'selected' : ''
+                    }`}
+                    key={document.id}
+                  >
+                    <button
+                      className={`paper-row ${
+                        document.id === selectedDocumentId ? 'selected' : ''
+                      }`}
+                      type="button"
+                      onClick={() => selectDocument(document)}
+                    >
+                      <BookOpen size={15} aria-hidden="true" />
+                      <span>
+                        <strong>{document.title}</strong>
+                        <small>
+                          {document.pageCount} 页 | {document.status} | 第{' '}
+                          {document.lastOpenedPage} 页
+                        </small>
+                      </span>
+                    </button>
+                    <button
+                      className="row-delete-button"
+                      type="button"
+                      title={`删除「${document.title}」`}
+                      aria-label={`删除「${document.title}」`}
+                      onClick={() => void deleteDocument(document)}
+                    >
+                      <Trash2 size={14} aria-hidden="true" />
+                    </button>
+                  </div>
+                ))
+              ) : (
+                <div className="empty-state compact">没有找到匹配文献。</div>
+              )
             ) : (
               <button className="empty-state compact" type="button" onClick={() => void importPdf()}>
                 文献库为空，点击导入 PDF。
