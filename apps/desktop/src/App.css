@@ -1,20 +1,29 @@
 .app-shell {
   display: grid;
-  grid-template-columns: 292px minmax(520px, 1fr) 392px;
+  grid-template-columns: 292px minmax(360px, 1fr) 8px var(--pdf-pane-width, 520px);
   min-height: 100vh;
   overflow: hidden;
   background: var(--bg);
 }
 
-.app-shell.pdf-focused {
-  grid-template-columns: 220px minmax(420px, 0.7fr) minmax(460px, 1fr);
+.app-shell.pdf-collapsed {
+  grid-template-columns: 292px minmax(0, 1fr) 0 48px;
+}
+
+.app-shell.is-resizing-pdf {
+  cursor: col-resize;
+  user-select: none;
 }
 
 .sidebar,
-.workspace,
-.pdf-pane {
+.workspace {
   min-height: 100vh;
   overflow: auto;
+}
+
+.pdf-pane,
+.pdf-resize-handle {
+  min-height: 100vh;
 }
 
 .sidebar {
@@ -269,6 +278,7 @@ kbd {
   display: grid;
   grid-template-rows: auto auto 1fr auto;
   gap: 16px;
+  min-width: 0;
   padding: 18px;
 }
 
@@ -465,40 +475,105 @@ kbd {
 .pdf-pane {
   display: grid;
   grid-template-rows: auto 1fr auto;
+  min-width: 0;
+  overflow: hidden;
   border-left: 1px solid var(--border);
   background: #0f1419;
+}
+
+.pdf-resize-handle {
+  width: 8px;
+  cursor: col-resize;
+  background: #0f1419;
+  border-left: 1px solid var(--border);
+  border-right: 1px solid var(--border);
+  touch-action: none;
+}
+
+.pdf-resize-handle:hover,
+.app-shell.is-resizing-pdf .pdf-resize-handle {
+  background: rgba(61, 189, 199, 0.16);
+}
+
+.app-shell.pdf-collapsed .pdf-resize-handle {
+  width: 0;
+  pointer-events: none;
+  border: 0;
 }
 
 .pdf-toolbar {
   justify-content: space-between;
   gap: 12px;
+  min-width: 0;
   padding: 18px;
   border-bottom: 1px solid var(--border);
 }
 
+.pdf-toolbar > div:first-child {
+  min-width: 0;
+}
+
+.pdf-toolbar h2 {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .toolbar-actions {
   display: flex;
+  flex: none;
   gap: 6px;
 }
 
 .pdf-stage {
-  display: grid;
-  place-items: center;
   min-height: 0;
   padding: 22px;
   overflow: auto;
 }
 
+.pdf-document {
+  display: grid;
+  width: max-content;
+  min-width: 100%;
+  justify-items: center;
+  gap: 18px;
+  margin: 0 auto;
+}
+
+.pdf-page-shell {
+  display: grid;
+  width: 100%;
+  justify-items: center;
+  gap: 8px;
+}
+
 .pdf-canvas {
+  display: block;
   max-width: none;
   border-radius: 3px;
   background: #f7f2e8;
   box-shadow: 0 24px 80px rgba(0, 0, 0, 0.35);
 }
 
+.pdf-page-label {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 3px 8px;
+  color: var(--text-muted);
+  background: rgba(17, 21, 27, 0.82);
+  font-size: 11px;
+}
+
+.pdf-page-shell.active .pdf-page-label {
+  color: var(--text-strong);
+  border-color: var(--accent-border);
+  background: var(--accent-soft);
+}
+
 .pdf-footer {
   display: flex;
   gap: 8px;
+  flex-wrap: wrap;
   padding: 14px 18px 18px;
   border-top: 1px solid var(--border);
 }
@@ -506,4 +581,25 @@ kbd {
 .pdf-footer .danger-button {
   border-color: rgba(239, 68, 68, 0.36);
   background: rgba(239, 68, 68, 0.1);
+}
+
+.pdf-pane-collapsed {
+  display: grid;
+  grid-template-rows: auto 1fr;
+  justify-items: center;
+  gap: 12px;
+  padding: 12px 8px;
+}
+
+.pdf-expand-button {
+  width: 32px;
+  height: 32px;
+}
+
+.pdf-pane-collapsed span {
+  color: var(--text-muted);
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0;
+  writing-mode: vertical-rl;
 }

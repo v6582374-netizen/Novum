@@ -1,6 +1,9 @@
 import { invoke } from '@tauri-apps/api/core'
 import { open } from '@tauri-apps/plugin-dialog'
 import {
+  type CSSProperties,
+  type PointerEvent as ReactPointerEvent,
+  type UIEvent as ReactUIEvent,
   useCallback,
   useEffect,
   useMemo,
@@ -18,7 +21,6 @@ import {
   FlaskConical,
   Library,
   Loader2,
-  Maximize2,
   MessageSquareText,
   PanelRight,
   Play,
@@ -58,6 +60,10 @@ type PdfBytes = {
   fileName: string
   bytes: number[]
 }
+
+const DEFAULT_PDF_PANE_WIDTH = 520
+const MIN_PDF_PANE_WIDTH = 420
+const MAX_PDF_PANE_WIDTH = 900
 
 const skills = [
   {
@@ -102,10 +108,86 @@ function cleanupPdfDocument(document: PDFDocumentProxy | null) {
   void document?.cleanup()
 }
 
-function App() {
+type PdfPageCanvasProps = {
+  active: boolean
+  pageNumber: number
+  pdfDocument: PDFDocumentProxy
+  stageWidth: number
+  zoom: number
+  onRenderError: (message: string) => void
+}
+
+function PdfPageCanvas({
+  active,
+  pageNumber,
+  pdfDocument,
+  stageWidth,
+  zoom,
+  onRenderError,
+}: PdfPageCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
+
+  useEffect(() => {
+    let cancelled = false
+    let renderTask: { promise: Promise<unknown>; cancel: () => void } | null = null
+
+    async function renderPage() {
+      const canvas = canvasRef.current
+      if (!canvas) return
+
+      const page = await pdfDocument.getPage(pageNumber)
+      if (cancelled || !canvasRef.current) return
+
+      const context = canvas.getContext('2d')
+      if (!context) return
+
+      const baseViewport = page.getViewport({ scale: 1 })
+      const availableWidth = Math.max(280, stageWidth || DEFAULT_PDF_PANE_WIDTH)
+      const fitScale = clamp(availableWidth / baseViewport.width, 0.35, 1.6)
+      const viewport = page.getViewport({ scale: fitScale * (zoom / 100) })
+      const devicePixelRatio = window.devicePixelRatio || 1
+
+      canvas.width = Math.floor(viewport.width * devicePixelRatio)
+      canvas.height = Math.floor(viewport.height * devicePixelRatio)
+      canvas.style.width = `${viewport.width}px`
+      canvas.style.height = `${viewport.height}px`
+
+      context.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0)
+      renderTask = page.render({ canvas, canvasContext: context, viewport })
+      await renderTask.promise
+    }
+
+    void renderPage().catch((reason) => {
+      const message = String(reason)
+      if (message.includes('RenderingCancelledException')) return
+      if (!cancelled) {
+        onRenderError(message)
+      }
+    })
+
+    return () => {
+      cancelled = true
+      renderTask?.cancel()
+    }
+  }, [onRenderError, pageNumber, pdfDocument, stageWidth, zoom])
+
+  return (
+    <article
+      className={`pdf-page-shell ${active ? 'active' : ''}`}
+      data-page={pageNumber}
+      aria-label={`第 ${pageNumber} 页`}
+    >
+      <canvas className="pdf-canvas" ref={canvasRef} />
+      <span className="pdf-page-label">第 {pageNumber} 页</span>
+    </article>
+  )
+}
+
+function App() {
+  const pdfStageRef = useRef<HTMLDivElement | null>(null)
+  const currentPageRef = useRef(1)
   const selectedDocumentIdRef = useRef<string | null>(null)
-  const renderTaskRef = useRef<{ cancel: () => void } | null>(null)
+  const pdfResizeActiveRef = useRef(false)
   const [activePanel, setActivePanel] = useState<PanelId>('library')
   const [documents, setDocuments] = useState<DocumentRecord[]>([])
   const [selectedDocumentId, setSelectedDocumentId] = useState<string | null>(null)
@@ -117,7 +199,10 @@ function App() {
   const [isLoadingLibrary, setIsLoadingLibrary] = useState(true)
   const [isImporting, setIsImporting] = useState(false)
   const [isLoadingPdf, setIsLoadingPdf] = useState(false)
-  const [isPdfFocused, setIsPdfFocused] = useState(false)
+  const [isPdfCollapsed, setIsPdfCollapsed] = useState(false)
+  const [isResizingPdf, setIsResizingPdf] = useState(false)
+  const [pdfPaneWidth, setPdfPaneWidth] = useState(DEFAULT_PDF_PANE_WIDTH)
+  const [pdfStageWidth, setPdfStageWidth] = useState(DEFAULT_PDF_PANE_WIDTH)
   const [isCommandOpen, setIsCommandOpen] = useState(false)
   const [selectedCitationPage, setSelectedCitationPage] = useState(1)
   const [message, setMessage] = useState('正在读取本地文献库。')
@@ -128,10 +213,35 @@ function App() {
     [documents, selectedDocumentId],
   )
   const selectedSkill = skills[selectedSkillIndex]
+  const pdfPageCount = pdfDocument?.numPages ?? selectedDocument?.pageCount ?? 0
+  const pdfPageNumbers = useMemo(
+    () => Array.from({ length: pdfPageCount }, (_, index) => index + 1),
+    [pdfPageCount],
+  )
+  const appShellStyle = {
+    '--pdf-pane-width': `${pdfPaneWidth}px`,
+  } as CSSProperties
 
   useEffect(() => {
     selectedDocumentIdRef.current = selectedDocumentId
   }, [selectedDocumentId])
+
+  useEffect(() => {
+    currentPageRef.current = currentPage
+  }, [currentPage])
+
+  const reportPdfRenderError = useCallback((renderError: string) => {
+    setError(renderError)
+    setMessage('渲染 PDF 页面失败。')
+  }, [])
+
+  const scrollPdfToPage = useCallback((page: number, behavior: ScrollBehavior = 'smooth') => {
+    window.requestAnimationFrame(() => {
+      const stage = pdfStageRef.current
+      const target = stage?.querySelector<HTMLElement>(`[data-page="${page}"]`)
+      target?.scrollIntoView({ block: 'start', behavior })
+    })
+  }, [])
 
   const panelTitle = useMemo(() => {
     if (activePanel === 'library') return '文献库'
@@ -206,6 +316,22 @@ function App() {
   }, [loadDocuments])
 
   useEffect(() => {
+    if (isPdfCollapsed) return
+
+    const stage = pdfStageRef.current
+    if (!stage) return
+
+    const observer = new ResizeObserver(([entry]) => {
+      setPdfStageWidth(entry.contentRect.width)
+    })
+
+    observer.observe(stage)
+    setPdfStageWidth(Math.max(280, stage.clientWidth - 44))
+
+    return () => observer.disconnect()
+  }, [isPdfCollapsed])
+
+  useEffect(() => {
     let cancelled = false
     let loadingTask: ReturnType<typeof pdfjsLib.getDocument> | null = null
 
@@ -261,59 +387,18 @@ function App() {
     return () => {
       cancelled = true
       void loadingTask?.destroy()
-      renderTaskRef.current?.cancel()
     }
   }, [selectedDocumentId])
 
   useEffect(() => {
-    let cancelled = false
-    let renderTask: { promise: Promise<unknown>; cancel: () => void } | null = null
+    if (!pdfDocument || isLoadingPdf || isPdfCollapsed) return
 
-    async function renderPage() {
-      if (!pdfDocument || !canvasRef.current) return
+    const timeout = window.setTimeout(() => {
+      scrollPdfToPage(currentPageRef.current, 'auto')
+    }, 120)
 
-      renderTaskRef.current?.cancel()
-      const page = await pdfDocument.getPage(currentPage)
-      if (cancelled || !canvasRef.current) return
-
-      const canvas = canvasRef.current
-      const context = canvas.getContext('2d')
-      if (!context) return
-
-      const devicePixelRatio = window.devicePixelRatio || 1
-      const viewport = page.getViewport({ scale: zoom / 100 * 1.25 })
-      canvas.width = Math.floor(viewport.width * devicePixelRatio)
-      canvas.height = Math.floor(viewport.height * devicePixelRatio)
-      canvas.style.width = `${viewport.width}px`
-      canvas.style.height = `${viewport.height}px`
-
-      context.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0)
-      renderTask = page.render({ canvas, canvasContext: context, viewport })
-      renderTaskRef.current = renderTask
-      await renderTask.promise
-
-      if (renderTaskRef.current === renderTask) {
-        renderTaskRef.current = null
-      }
-    }
-
-    void renderPage().catch((reason) => {
-      const message = String(reason)
-      if (message.includes('RenderingCancelledException')) return
-      if (!cancelled) {
-        setError(message)
-        setMessage('渲染 PDF 页面失败。')
-      }
-    })
-
-    return () => {
-      cancelled = true
-      renderTask?.cancel()
-      if (renderTaskRef.current === renderTask) {
-        renderTaskRef.current = null
-      }
-    }
-  }, [currentPage, pdfDocument, zoom])
+    return () => window.clearTimeout(timeout)
+  }, [isLoadingPdf, isPdfCollapsed, pdfDocument, scrollPdfToPage, selectedDocumentId])
 
   useEffect(() => {
     if (!selectedDocumentId) return
@@ -431,10 +516,11 @@ function App() {
 
   function jumpToPage(page: number) {
     if (!selectedDocument) return
-    const nextPage = clamp(page, 1, selectedDocument.pageCount)
+    const nextPage = clamp(page, 1, pdfPageCount || selectedDocument.pageCount)
     setCurrentPage(nextPage)
     setSelectedCitationPage(nextPage)
     setMessage(`已跳转到第 ${nextPage} 页。`)
+    scrollPdfToPage(nextPage)
   }
 
   function adjustZoom(delta: number) {
@@ -445,8 +531,68 @@ function App() {
     })
   }
 
+  function handlePdfScroll(event: ReactUIEvent<HTMLDivElement>) {
+    const stage = event.currentTarget
+    const pages = Array.from(stage.querySelectorAll<HTMLElement>('.pdf-page-shell'))
+    if (!pages.length) return
+
+    const stageRect = stage.getBoundingClientRect()
+    const viewportCenter = stageRect.top + stageRect.height / 2
+    const closestPage = pages.reduce(
+      (closest, page) => {
+        const pageRect = page.getBoundingClientRect()
+        const distance = Math.abs(pageRect.top + pageRect.height / 2 - viewportCenter)
+        return distance < closest.distance
+          ? { distance, pageNumber: Number(page.dataset.page) }
+          : closest
+      },
+      { distance: Number.POSITIVE_INFINITY, pageNumber: currentPageRef.current },
+    ).pageNumber
+
+    if (!Number.isFinite(closestPage) || closestPage === currentPageRef.current) return
+
+    currentPageRef.current = closestPage
+    setCurrentPage(closestPage)
+    setSelectedCitationPage(closestPage)
+  }
+
+  function startPdfResize(event: ReactPointerEvent<HTMLDivElement>) {
+    if (isPdfCollapsed) return
+
+    pdfResizeActiveRef.current = true
+    setIsResizingPdf(true)
+    event.currentTarget.setPointerCapture(event.pointerId)
+    event.preventDefault()
+  }
+
+  function resizePdfPane(event: ReactPointerEvent<HTMLDivElement>) {
+    if (!pdfResizeActiveRef.current || isPdfCollapsed) return
+
+    const maxWidth = clamp(
+      window.innerWidth - 292 - 360 - 8,
+      MIN_PDF_PANE_WIDTH,
+      MAX_PDF_PANE_WIDTH,
+    )
+    setPdfPaneWidth(clamp(window.innerWidth - event.clientX, MIN_PDF_PANE_WIDTH, maxWidth))
+  }
+
+  function stopPdfResize(event: ReactPointerEvent<HTMLDivElement>) {
+    if (!pdfResizeActiveRef.current) return
+
+    pdfResizeActiveRef.current = false
+    setIsResizingPdf(false)
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId)
+    }
+  }
+
   return (
-    <main className={`app-shell ${isPdfFocused ? 'pdf-focused' : ''}`}>
+    <main
+      className={`app-shell ${isPdfCollapsed ? 'pdf-collapsed' : ''} ${
+        isResizingPdf ? 'is-resizing-pdf' : ''
+      }`}
+      style={appShellStyle}
+    >
       <aside className="sidebar" aria-label="科研工作区导航">
         <div className="brand-row">
           <div className="brand-mark">N</div>
@@ -720,6 +866,34 @@ function App() {
         </section>
       </section>
 
+      <div
+        className="pdf-resize-handle"
+        role={isPdfCollapsed ? undefined : 'separator'}
+        aria-label={isPdfCollapsed ? undefined : '调整 PDF 预览宽度'}
+        aria-orientation={isPdfCollapsed ? undefined : 'vertical'}
+        onDoubleClick={() => setPdfPaneWidth(DEFAULT_PDF_PANE_WIDTH)}
+        onPointerCancel={stopPdfResize}
+        onPointerDown={startPdfResize}
+        onPointerMove={resizePdfPane}
+        onPointerUp={stopPdfResize}
+      />
+
+      {isPdfCollapsed ? (
+        <aside className="pdf-pane pdf-pane-collapsed" aria-label="PDF 预览已折叠">
+          <button
+            className="icon-button pdf-expand-button"
+            type="button"
+            title="展开 PDF"
+            onClick={() => {
+              setIsPdfCollapsed(false)
+              setMessage('PDF 预览已展开。')
+            }}
+          >
+            <ChevronLeft size={15} aria-hidden="true" />
+          </button>
+          <span>PDF</span>
+        </aside>
+      ) : (
       <aside className="pdf-pane" aria-label="PDF 预览">
         <header className="pdf-toolbar">
           <div>
@@ -741,7 +915,7 @@ function App() {
               type="button"
               title="下一页"
               onClick={() => jumpToPage(currentPage + 1)}
-              disabled={!selectedDocument || currentPage >= (selectedDocument?.pageCount ?? 1)}
+              disabled={!selectedDocument || currentPage >= (pdfPageCount || 1)}
             >
               <ChevronRight size={15} aria-hidden="true" />
             </button>
@@ -764,28 +938,39 @@ function App() {
               <ZoomIn size={15} aria-hidden="true" />
             </button>
             <button
-              className={`icon-button ${isPdfFocused ? 'active' : ''}`}
+              className="icon-button"
               type="button"
-              title="聚焦 PDF"
+              title="折叠 PDF"
               onClick={() => {
-                setIsPdfFocused((value) => !value)
-                setMessage('PDF 聚焦模式已切换。')
+                setIsPdfCollapsed(true)
+                setMessage('PDF 预览已折叠。')
               }}
-              disabled={!selectedDocument}
             >
-              <Maximize2 size={15} aria-hidden="true" />
+              <ChevronRight size={15} aria-hidden="true" />
             </button>
           </div>
         </header>
 
-        <div className="pdf-stage">
+        <div className="pdf-stage" ref={pdfStageRef} onScroll={handlePdfScroll}>
           {isLoadingPdf ? (
             <div className="empty-state">
               <Loader2 className="spin" size={24} aria-hidden="true" />
               <strong>正在加载 PDF</strong>
             </div>
           ) : selectedDocument && pdfDocument ? (
-            <canvas className="pdf-canvas" ref={canvasRef} />
+            <div className="pdf-document">
+              {pdfPageNumbers.map((pageNumber) => (
+                <PdfPageCanvas
+                  active={pageNumber === currentPage}
+                  key={`${selectedDocument.id}-${pageNumber}`}
+                  pageNumber={pageNumber}
+                  pdfDocument={pdfDocument}
+                  stageWidth={pdfStageWidth}
+                  zoom={zoom}
+                  onRenderError={reportPdfRenderError}
+                />
+              ))}
+            </div>
           ) : (
             <div className="empty-state">
               <FileText size={24} aria-hidden="true" />
@@ -815,6 +1000,7 @@ function App() {
           </button>
         </footer>
       </aside>
+      )}
     </main>
   )
 }
