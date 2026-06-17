@@ -1,12 +1,23 @@
-import { useMemo, useState } from 'react'
+import { invoke } from '@tauri-apps/api/core'
+import { open } from '@tauri-apps/plugin-dialog'
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react'
 import {
   BookOpen,
   BrainCircuit,
+  ChevronLeft,
   ChevronRight,
   Command,
   FileSearch,
+  FileText,
   FlaskConical,
   Library,
+  Loader2,
   Maximize2,
   MessageSquareText,
   PanelRight,
@@ -14,72 +25,56 @@ import {
   Search,
   Settings,
   Sparkles,
+  Trash2,
   Upload,
   ZoomIn,
   ZoomOut,
 } from 'lucide-react'
+import * as pdfjsLib from 'pdfjs-dist'
+import type { PDFDocumentProxy } from 'pdfjs-dist'
+import pdfWorker from 'pdfjs-dist/build/pdf.worker.min.mjs?url'
 import './App.css'
+
+pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorker
 
 type PanelId = 'library' | 'qa' | 'skills' | 'settings'
 
-const papers = [
-  {
-    title: '科学发现中的尺度定律',
-    venue: '前沿札记',
-    pages: 28,
-    status: '已索引',
-    question: '当前论文的主要实验瓶颈是什么？',
-    answer:
-      '论文指出，关键瓶颈不在单次推理能力，而在假设生成、文献验证和实验设计之间的往返延迟。Novum 会把回答、引用和 PDF 页码保持同步，帮助研究者快速回到证据原文。',
-    excerpt:
-      '一个持续存在的限制，是从假设生成到文献验证，再到定向实验设计之间的延迟。',
-  },
-  {
-    title: '蛋白质模型中的机制可解释性',
-    venue: '阅读队列',
-    pages: 42,
-    status: '待索引',
-    question: '这篇论文最值得优先追踪的证据是什么？',
-    answer:
-      '当前阅读优先级应放在模型内部表征与实验可观测结构之间的对应关系。后续接入论文问答引擎后，这里会展示跨段落引用和可跳转证据。',
-    excerpt:
-      '模型内部特征需要和可验证的结构、生物物理约束以及实验观测建立对应。',
-  },
-  {
-    title: '闭环假设生成',
-    venue: '方法库',
-    pages: 19,
-    status: '已索引',
-    question: '闭环研究流程最需要降低哪类成本？',
-    answer:
-      '最需要降低的是从候选假设到下一步可执行实验之间的组织成本。Novum 的目标是让工具调用、证据定位和研究记录形成同一个本地闭环。',
-    excerpt:
-      '闭环系统的价值来自快速把候选假设转化为可验证的下一步动作。',
-  },
-]
+type DocumentRecord = {
+  id: string
+  title: string
+  fileName: string
+  storedPath: string
+  fingerprint: string
+  pageCount: number
+  status: string
+  createdAt: string
+  updatedAt: string
+  lastOpenedPage: number
+  lastZoom: number
+}
+
+type PdfBytes = {
+  documentId: string
+  fileName: string
+  bytes: number[]
+}
 
 const skills = [
   {
     name: 'AlphaGenome 检索',
     domain: '基因组学',
-    state: '可运行',
+    state: '待接入',
   },
   {
     name: 'UniProt 证据提取',
     domain: '生物学',
-    state: '需要输入',
+    state: '待接入',
   },
   {
     name: 'AFDB 结构搜索',
     domain: '蛋白质',
-    state: '可运行',
+    state: '待接入',
   },
-]
-
-const citations = [
-  { label: '第 4 页', page: 4 },
-  { label: '第 11 页', page: 11 },
-  { label: '第 18 页', page: 18 },
 ]
 
 const panels: Array<{
@@ -93,19 +88,39 @@ const panels: Array<{
   { id: 'settings', label: '模型配置', icon: Settings },
 ]
 
+function clamp(value: number, min: number, max: number) {
+  return Math.min(max, Math.max(min, value))
+}
+
+function uniquePages(pages: number[], pageCount: number) {
+  return Array.from(
+    new Set(pages.map((page) => clamp(page, 1, pageCount)).filter(Boolean)),
+  )
+}
+
 function App() {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null)
   const [activePanel, setActivePanel] = useState<PanelId>('library')
-  const [selectedPaperIndex, setSelectedPaperIndex] = useState(0)
+  const [documents, setDocuments] = useState<DocumentRecord[]>([])
+  const [selectedDocumentId, setSelectedDocumentId] = useState<string | null>(null)
   const [selectedSkillIndex, setSelectedSkillIndex] = useState(0)
-  const [selectedCitationIndex, setSelectedCitationIndex] = useState(0)
+  const [currentPage, setCurrentPage] = useState(1)
   const [zoom, setZoom] = useState(100)
+  const [pdfDocument, setPdfDocument] = useState<PDFDocumentProxy | null>(null)
+  const [isLoadingLibrary, setIsLoadingLibrary] = useState(true)
+  const [isImporting, setIsImporting] = useState(false)
+  const [isLoadingPdf, setIsLoadingPdf] = useState(false)
   const [isPdfFocused, setIsPdfFocused] = useState(false)
   const [isCommandOpen, setIsCommandOpen] = useState(false)
-  const [message, setMessage] = useState('已打开本地文献工作台。')
+  const [selectedCitationPage, setSelectedCitationPage] = useState(1)
+  const [message, setMessage] = useState('正在读取本地文献库。')
+  const [error, setError] = useState<string | null>(null)
 
-  const selectedPaper = papers[selectedPaperIndex]
+  const selectedDocument = useMemo(
+    () => documents.find((document) => document.id === selectedDocumentId) ?? null,
+    [documents, selectedDocumentId],
+  )
   const selectedSkill = skills[selectedSkillIndex]
-  const selectedCitation = citations[selectedCitationIndex]
 
   const panelTitle = useMemo(() => {
     if (activePanel === 'library') return '文献库'
@@ -114,46 +129,239 @@ function App() {
     return '模型配置'
   }, [activePanel])
 
+  const citationPages = useMemo(() => {
+    if (!selectedDocument) return []
+    return uniquePages(
+      [currentPage, currentPage + 2, selectedDocument.pageCount],
+      selectedDocument.pageCount,
+    )
+  }, [currentPage, selectedDocument])
+
+  const loadDocuments = useCallback(async () => {
+    setIsLoadingLibrary(true)
+    setError(null)
+    try {
+      const library = await invoke<DocumentRecord[]>('list_documents')
+      setDocuments(library)
+      setSelectedDocumentId((current) => {
+        if (current && library.some((document) => document.id === current)) {
+          return current
+        }
+        return library[0]?.id ?? null
+      })
+      setMessage(library.length ? '已载入本地文献库。' : '文献库为空，请先导入 PDF。')
+    } catch (reason) {
+      setError(String(reason))
+      setMessage('读取本地文献库失败。')
+    } finally {
+      setIsLoadingLibrary(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    void Promise.resolve().then(loadDocuments)
+  }, [loadDocuments])
+
+  useEffect(() => {
+    let cancelled = false
+
+    async function loadPdf() {
+      if (!selectedDocument) {
+        setPdfDocument(null)
+        setCurrentPage(1)
+        setZoom(100)
+        return
+      }
+
+      setIsLoadingPdf(true)
+      setError(null)
+      try {
+        const payload = await invoke<PdfBytes>('get_document_pdf_bytes', {
+          id: selectedDocument.id,
+        })
+        if (cancelled) return
+
+        const loadingTask = pdfjsLib.getDocument({
+          data: Uint8Array.from(payload.bytes),
+        })
+        const loadedPdf = await loadingTask.promise
+        if (cancelled) {
+          return
+        }
+
+        setPdfDocument(loadedPdf)
+        setCurrentPage(clamp(selectedDocument.lastOpenedPage || 1, 1, loadedPdf.numPages))
+        setSelectedCitationPage(
+          clamp(selectedDocument.lastOpenedPage || 1, 1, loadedPdf.numPages),
+        )
+        setZoom(clamp(selectedDocument.lastZoom || 100, 60, 180))
+      } catch (reason) {
+        setError(String(reason))
+        setPdfDocument(null)
+        setMessage('加载 PDF 失败。')
+      } finally {
+        if (!cancelled) {
+          setIsLoadingPdf(false)
+        }
+      }
+    }
+
+    void loadPdf()
+    return () => {
+      cancelled = true
+    }
+  }, [selectedDocument])
+
+  useEffect(() => {
+    let cancelled = false
+
+    async function renderPage() {
+      if (!pdfDocument || !canvasRef.current) return
+
+      const page = await pdfDocument.getPage(currentPage)
+      if (cancelled || !canvasRef.current) return
+
+      const canvas = canvasRef.current
+      const context = canvas.getContext('2d')
+      if (!context) return
+
+      const devicePixelRatio = window.devicePixelRatio || 1
+      const viewport = page.getViewport({ scale: zoom / 100 * 1.25 })
+      canvas.width = Math.floor(viewport.width * devicePixelRatio)
+      canvas.height = Math.floor(viewport.height * devicePixelRatio)
+      canvas.style.width = `${viewport.width}px`
+      canvas.style.height = `${viewport.height}px`
+
+      context.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0)
+      await page.render({ canvas, canvasContext: context, viewport }).promise
+    }
+
+    void renderPage().catch((reason) => {
+      if (!cancelled) {
+        setError(String(reason))
+        setMessage('渲染 PDF 页面失败。')
+      }
+    })
+
+    return () => {
+      cancelled = true
+    }
+  }, [currentPage, pdfDocument, zoom])
+
+  useEffect(() => {
+    if (!selectedDocument) return
+
+    const timeout = window.setTimeout(() => {
+      invoke<DocumentRecord>('update_reading_state', {
+        id: selectedDocument.id,
+        page: currentPage,
+        zoom,
+      })
+        .then((updated) => {
+          setDocuments((current) =>
+            current.map((document) => (document.id === updated.id ? updated : document)),
+          )
+        })
+        .catch((reason) => {
+          setError(String(reason))
+        })
+    }, 350)
+
+    return () => window.clearTimeout(timeout)
+  }, [currentPage, selectedDocument, zoom])
+
   function selectPanel(panel: PanelId) {
     setActivePanel(panel)
     setIsCommandOpen(false)
     setMessage(`已切换到「${panels.find((item) => item.id === panel)?.label}」。`)
   }
 
-  function selectPaper(index: number) {
-    setSelectedPaperIndex(index)
-    setSelectedCitationIndex(0)
+  function selectDocument(document: DocumentRecord) {
+    setSelectedDocumentId(document.id)
+    setSelectedCitationPage(document.lastOpenedPage || 1)
     setActivePanel('library')
-    setMessage(`已选中文献「${papers[index].title}」。`)
+    setMessage(`已打开文献「${document.title}」。`)
+  }
+
+  async function importPdf() {
+    setIsImporting(true)
+    setError(null)
+    try {
+      const selected = await open({
+        multiple: false,
+        filters: [{ name: 'PDF 文献', extensions: ['pdf'] }],
+      })
+
+      if (!selected || Array.isArray(selected)) {
+        setMessage('已取消导入。')
+        return
+      }
+
+      const imported = await invoke<DocumentRecord>('import_pdf_from_path', {
+        path: selected,
+      })
+      await loadDocuments()
+      setSelectedDocumentId(imported.id)
+      setActivePanel('library')
+      setMessage(`已导入文献「${imported.title}」。`)
+    } catch (reason) {
+      setError(String(reason))
+      setMessage('导入 PDF 失败。')
+    } finally {
+      setIsImporting(false)
+    }
+  }
+
+  async function deleteSelectedDocument() {
+    if (!selectedDocument) return
+
+    setError(null)
+    try {
+      await invoke<boolean>('delete_document', { id: selectedDocument.id })
+      setMessage(`已删除文献「${selectedDocument.title}」。`)
+      setPdfDocument(null)
+      setSelectedDocumentId(null)
+      await loadDocuments()
+    } catch (reason) {
+      setError(String(reason))
+      setMessage('删除文献失败。')
+    }
+  }
+
+  function runPaperQa() {
+    setActivePanel('qa')
+    if (!selectedDocument) {
+      setMessage('请先导入并选择一篇 PDF 文献。')
+      return
+    }
+    setMessage('论文问答引擎尚未接入。本阶段只完成文献库、PDF 预览和阅读状态。')
   }
 
   function selectSkill(index: number) {
     setSelectedSkillIndex(index)
     setActivePanel('skills')
-    setMessage(`已选中技能「${skills[index].name}」。`)
-  }
-
-  function runPaperQa() {
-    setActivePanel('qa')
-    setMessage(`已基于「${selectedPaper.title}」生成一条模拟论文问答。`)
-  }
-
-  function jumpToCitation(index: number) {
-    setSelectedCitationIndex(index)
-    setMessage(`已跳转到「${selectedPaper.title}」${citations[index].label}。`)
-  }
-
-  function adjustZoom(delta: number) {
-    setZoom((current) => {
-      const next = Math.min(140, Math.max(80, current + delta))
-      setMessage(`PDF 缩放已调整为 ${next}%。`)
-      return next
-    })
+    setMessage(`已选中技能「${skills[index].name}」。技能执行器将在后续阶段接入。`)
   }
 
   function runSkill() {
     setActivePanel('skills')
-    setMessage(`已准备运行「${selectedSkill.name}」，真实执行器将在后续接入。`)
+    setMessage(`「${selectedSkill.name}」尚未接入真实执行器。`)
+  }
+
+  function jumpToPage(page: number) {
+    if (!selectedDocument) return
+    const nextPage = clamp(page, 1, selectedDocument.pageCount)
+    setCurrentPage(nextPage)
+    setSelectedCitationPage(nextPage)
+    setMessage(`已跳转到第 ${nextPage} 页。`)
+  }
+
+  function adjustZoom(delta: number) {
+    setZoom((current) => {
+      const next = clamp(current + delta, 60, 180)
+      setMessage(`PDF 缩放已调整为 ${next}%。`)
+      return next
+    })
   }
 
   return (
@@ -205,31 +413,45 @@ function App() {
               className="icon-button"
               type="button"
               title="导入 PDF"
-              onClick={() => {
-                setActivePanel('library')
-                setMessage('PDF 导入入口已触发，真实文件选择器将在下一阶段接入。')
-              }}
+              onClick={() => void importPdf()}
+              disabled={isImporting}
             >
-              <Upload size={15} aria-hidden="true" />
+              {isImporting ? (
+                <Loader2 className="spin" size={15} aria-hidden="true" />
+              ) : (
+                <Upload size={15} aria-hidden="true" />
+              )}
             </button>
           </div>
+
           <div className="paper-list">
-            {papers.map((paper, index) => (
-              <button
-                className={`paper-row ${index === selectedPaperIndex ? 'selected' : ''}`}
-                key={paper.title}
-                type="button"
-                onClick={() => selectPaper(index)}
-              >
-                <BookOpen size={15} aria-hidden="true" />
-                <span>
-                  <strong>{paper.title}</strong>
-                  <small>
-                    {paper.venue} | {paper.pages} 页 | {paper.status}
-                  </small>
-                </span>
+            {isLoadingLibrary ? (
+              <div className="empty-state compact">正在读取文献库...</div>
+            ) : documents.length ? (
+              documents.map((document) => (
+                <button
+                  className={`paper-row ${
+                    document.id === selectedDocumentId ? 'selected' : ''
+                  }`}
+                  key={document.id}
+                  type="button"
+                  onClick={() => selectDocument(document)}
+                >
+                  <BookOpen size={15} aria-hidden="true" />
+                  <span>
+                    <strong>{document.title}</strong>
+                    <small>
+                      {document.pageCount} 页 | {document.status} | 第{' '}
+                      {document.lastOpenedPage} 页
+                    </small>
+                  </span>
+                </button>
+              ))
+            ) : (
+              <button className="empty-state compact" type="button" onClick={() => void importPdf()}>
+                文献库为空，点击导入 PDF。
               </button>
-            ))}
+            )}
           </div>
         </section>
 
@@ -242,7 +464,7 @@ function App() {
               title="搜索技能"
               onClick={() => {
                 setActivePanel('skills')
-                setMessage('技能搜索入口已触发。')
+                setMessage('技能搜索将在 science-skills 注册表接入后启用。')
               }}
             >
               <Search size={15} aria-hidden="true" />
@@ -276,7 +498,7 @@ function App() {
             <h2>{panelTitle}</h2>
           </div>
           <div className="status-strip" aria-label="本地运行状态">
-            <span>本地文献库已就绪</span>
+            <span>{documents.length ? `本地文献 ${documents.length} 篇` : '文献库为空'}</span>
             <span>模型尚未配置</span>
             <span>论文问答适配器待接入</span>
           </div>
@@ -286,7 +508,9 @@ function App() {
           <div className="query-input">
             <FileSearch size={18} aria-hidden="true" />
             <span>
-              围绕当前文献、选中文献集或当前引用发起问题。
+              {selectedDocument
+                ? `当前文献：${selectedDocument.title}`
+                : '请先导入 PDF，再围绕文献发起问题。'}
             </span>
             <button type="button" onClick={runPaperQa}>
               <Sparkles size={16} aria-hidden="true" />
@@ -299,6 +523,9 @@ function App() {
           <section className="command-panel" aria-label="命令面板">
             <p className="eyebrow">可用命令</p>
             <div className="command-list">
+              <button type="button" onClick={() => void importPdf()}>
+                导入 PDF
+              </button>
               <button type="button" onClick={runPaperQa}>
                 对当前文献提问
               </button>
@@ -308,15 +535,6 @@ function App() {
               <button type="button" onClick={runSkill}>
                 运行当前技能
               </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setActivePanel('settings')
-                  setMessage('已打开模型配置，真实密钥存储将在后续接入。')
-                }}
-              >
-                配置模型服务
-              </button>
             </div>
           </section>
         ) : null}
@@ -325,43 +543,68 @@ function App() {
           <div className="answer-header">
             <MessageSquareText size={18} aria-hidden="true" />
             <div>
-              <p className="eyebrow">当前问答</p>
-              <h3>{selectedPaper.question}</h3>
+              <p className="eyebrow">当前状态</p>
+              <h3>{selectedDocument ? selectedDocument.title : '尚未选择文献'}</h3>
             </div>
           </div>
-          <p>{selectedPaper.answer}</p>
+
+          {selectedDocument ? (
+            <div className="document-detail">
+              <p>
+                文件名：<strong>{selectedDocument.fileName}</strong>
+              </p>
+              <p>
+                页数：{selectedDocument.pageCount} | 阅读位置：第 {currentPage} 页 | 缩放：
+                {zoom}%
+              </p>
+              <p>
+                PaperQA 与科学技能执行尚未接入。本阶段保留真实文献、PDF 预览和阅读状态，
+                后续会基于当前文献 ID 调用研究适配器。
+              </p>
+            </div>
+          ) : (
+            <div className="empty-state">
+              <FileText size={24} aria-hidden="true" />
+              <strong>还没有导入文献</strong>
+              <span>点击左侧导入按钮，选择一份本地 PDF 开始。</span>
+            </div>
+          )}
+
           <div className="message-line" aria-live="polite">
-            {message}
+            {error ?? message}
           </div>
-          <div className="source-row" aria-label="回答引用">
-            {citations.map((source, index) => (
-              <button
-                className={index === selectedCitationIndex ? 'selected' : ''}
-                type="button"
-                key={source.label}
-                onClick={() => jumpToCitation(index)}
-              >
-                {source.label}
-              </button>
-            ))}
-          </div>
+
+          {selectedDocument ? (
+            <div className="source-row" aria-label="页码快捷跳转">
+              {citationPages.map((page) => (
+                <button
+                  className={page === selectedCitationPage ? 'selected' : ''}
+                  type="button"
+                  key={page}
+                  onClick={() => jumpToPage(page)}
+                >
+                  第 {page} 页
+                </button>
+              ))}
+            </div>
+          ) : null}
         </section>
 
         <section className="task-board" aria-label="研究任务状态">
           <article>
-            <p className="eyebrow">下一步集成</p>
+            <p className="eyebrow">已完成闭环</p>
+            <h3>本地文献库</h3>
+            <p>PDF 导入、复制、持久化、删除和阅读状态已经接入。</p>
+          </article>
+          <article>
+            <p className="eyebrow">当前阶段</p>
+            <h3>真实 PDF 预览</h3>
+            <p>右侧使用 PDF.js 渲染真实页面，并支持页码与缩放。</p>
+          </article>
+          <article>
+            <p className="eyebrow">下一步</p>
             <h3>论文问答适配器</h3>
-            <p>索引 PDF、回答当前文献问题，并返回可跳转引用。</p>
-          </article>
-          <article>
-            <p className="eyebrow">技能市场</p>
-            <h3>科学技能注册表</h3>
-            <p>展示技能元信息，同时隐藏脚本和参考资料目录。</p>
-          </article>
-          <article>
-            <p className="eyebrow">发布升级</p>
-            <h3>Homebrew 升级通道</h3>
-            <p>将命令行升级能力纳入 macOS 首发发布计划。</p>
+            <p>基于文献 ID 接入 PaperQA 索引、问答与引用跳转。</p>
           </article>
         </section>
       </section>
@@ -370,14 +613,33 @@ function App() {
         <header className="pdf-toolbar">
           <div>
             <p className="eyebrow">PDF 预览</p>
-            <h2>{selectedPaper.title}</h2>
+            <h2>{selectedDocument?.title ?? '未选择文献'}</h2>
           </div>
           <div className="toolbar-actions">
             <button
               className="icon-button"
               type="button"
+              title="上一页"
+              onClick={() => jumpToPage(currentPage - 1)}
+              disabled={!selectedDocument || currentPage <= 1}
+            >
+              <ChevronLeft size={15} aria-hidden="true" />
+            </button>
+            <button
+              className="icon-button"
+              type="button"
+              title="下一页"
+              onClick={() => jumpToPage(currentPage + 1)}
+              disabled={!selectedDocument || currentPage >= (selectedDocument?.pageCount ?? 1)}
+            >
+              <ChevronRight size={15} aria-hidden="true" />
+            </button>
+            <button
+              className="icon-button"
+              type="button"
               title="缩小"
               onClick={() => adjustZoom(-10)}
+              disabled={!selectedDocument}
             >
               <ZoomOut size={15} aria-hidden="true" />
             </button>
@@ -386,6 +648,7 @@ function App() {
               type="button"
               title="放大"
               onClick={() => adjustZoom(10)}
+              disabled={!selectedDocument}
             >
               <ZoomIn size={15} aria-hidden="true" />
             </button>
@@ -397,6 +660,7 @@ function App() {
                 setIsPdfFocused((value) => !value)
                 setMessage('PDF 聚焦模式已切换。')
               }}
+              disabled={!selectedDocument}
             >
               <Maximize2 size={15} aria-hidden="true" />
             </button>
@@ -404,34 +668,39 @@ function App() {
         </header>
 
         <div className="pdf-stage">
-          <div className="pdf-page" style={{ transform: `scale(${zoom / 100})` }}>
-            <div className="page-meta">
-              <span>
-                第 {selectedCitation.page} 页 / 共 {selectedPaper.pages} 页
-              </span>
-              <span>{zoom}%</span>
+          {isLoadingPdf ? (
+            <div className="empty-state">
+              <Loader2 className="spin" size={24} aria-hidden="true" />
+              <strong>正在加载 PDF</strong>
             </div>
-            <h3>实验瓶颈</h3>
-            <p>{selectedPaper.excerpt}</p>
-            <p className="highlight">
-              当前引用已同步到 {selectedCitation.label}。后续接入真实 PDF
-              后，这里会定位到论文原文段落。
-            </p>
-            <p>
-              右侧预览栏会在提问、运行技能和比较结果时保持可见，确保所有
-              智能体输出都能回到证据来源。
-            </p>
-          </div>
+          ) : selectedDocument && pdfDocument ? (
+            <canvas className="pdf-canvas" ref={canvasRef} />
+          ) : (
+            <div className="empty-state">
+              <FileText size={24} aria-hidden="true" />
+              <strong>等待 PDF</strong>
+              <span>导入文献后，这里会显示真实 PDF 页面。</span>
+            </div>
+          )}
         </div>
 
         <footer className="pdf-footer">
-          <button type="button" onClick={() => jumpToCitation(selectedCitationIndex)}>
+          <button type="button" onClick={() => jumpToPage(selectedCitationPage)} disabled={!selectedDocument}>
             <PanelRight size={15} aria-hidden="true" />
             同步引用
           </button>
           <button type="button" onClick={runSkill}>
             <Play size={15} aria-hidden="true" />
             运行技能
+          </button>
+          <button
+            className="danger-button"
+            type="button"
+            onClick={() => void deleteSelectedDocument()}
+            disabled={!selectedDocument}
+          >
+            <Trash2 size={15} aria-hidden="true" />
+            删除
           </button>
         </footer>
       </aside>
