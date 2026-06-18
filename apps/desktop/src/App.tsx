@@ -63,12 +63,23 @@ type PdfBytes = {
   bytes: number[]
 }
 
+type ProviderKind = 'openai-compatible' | 'deepseek' | 'test-relay'
+
 type ProviderSettings = {
-  provider: 'openai-compatible'
+  provider: ProviderKind
   baseUrl: string
   model: string
   hasApiKey: boolean
   updatedAt: string | null
+}
+
+type ProviderPreset = {
+  provider: ProviderKind
+  label: string
+  description: string
+  baseUrl: string
+  model: string
+  hasDevelopmentKey: boolean
 }
 
 type ProviderConnectionResult = {
@@ -167,7 +178,8 @@ const MIN_PDF_PANE_WIDTH = 420
 const MAX_PDF_PANE_WIDTH = 900
 const STRONGHOLD_PASSWORD = 'novum-phase3-local-vault'
 const STRONGHOLD_CLIENT = 'novum'
-const PROVIDER_API_KEY = 'openai-compatible-api-key'
+const LEGACY_PROVIDER_API_KEY = 'openai-compatible-api-key'
+const PROVIDER_API_KEY_PREFIX = 'provider-api-key:'
 
 const panels: Array<{
   id: PanelId
@@ -217,19 +229,27 @@ async function getCredentialClient() {
   }
 }
 
-async function saveProviderApiKey(apiKey: string) {
+function providerApiKeyName(provider: ProviderKind) {
+  return `${PROVIDER_API_KEY_PREFIX}${provider}`
+}
+
+async function saveProviderApiKey(provider: ProviderKind, apiKey: string) {
   const trimmed = apiKey.trim()
   if (!trimmed) return
 
   const encoded = Array.from(new TextEncoder().encode(trimmed))
   await withCredentialStore(async (store) => {
-    await store.insert(PROVIDER_API_KEY, encoded)
+    await store.insert(providerApiKeyName(provider), encoded)
   })
 }
 
-async function readProviderApiKey() {
+async function readProviderApiKey(provider: ProviderKind) {
   return withCredentialStore(async (store) => {
-    const value = await store.get(PROVIDER_API_KEY)
+    const value = await store.get(providerApiKeyName(provider))
+    if (!value && provider === 'openai-compatible') {
+      const legacyValue = await store.get(LEGACY_PROVIDER_API_KEY)
+      return legacyValue ? new TextDecoder().decode(legacyValue) : ''
+    }
     return value ? new TextDecoder().decode(value) : ''
   })
 }
@@ -339,7 +359,9 @@ function App() {
   const [isCommandOpen, setIsCommandOpen] = useState(false)
   const [selectedCitationPage, setSelectedCitationPage] = useState(1)
   const [providerSettings, setProviderSettings] = useState<ProviderSettings | null>(null)
+  const [providerPresets, setProviderPresets] = useState<ProviderPreset[]>([])
   const [providerForm, setProviderForm] = useState({
+    provider: 'openai-compatible' as ProviderKind,
     baseUrl: 'https://api.openai.com/v1',
     model: 'gpt-4o-mini',
     apiKey: '',
@@ -523,10 +545,15 @@ function App() {
   useEffect(() => {
     async function loadProviderSettings() {
       try {
-        const settings = await invoke<ProviderSettings>('get_provider_settings')
+        const [settings, presets] = await Promise.all([
+          invoke<ProviderSettings>('get_provider_settings'),
+          invoke<ProviderPreset[]>('get_provider_presets'),
+        ])
+        setProviderPresets(presets)
         setProviderSettings(settings)
         setProviderForm((current) => ({
           ...current,
+          provider: settings.provider,
           baseUrl: settings.baseUrl,
           model: settings.model,
           apiKey: '',
@@ -723,12 +750,12 @@ function App() {
   async function persistProviderSettings(showSuccess = true) {
     const apiKey = providerForm.apiKey.trim()
     if (apiKey) {
-      await saveProviderApiKey(apiKey)
+      await saveProviderApiKey(providerForm.provider, apiKey)
     }
 
     const settings = await invoke<ProviderSettings>('save_provider_settings', {
       settings: {
-        provider: 'openai-compatible',
+        provider: providerForm.provider,
         baseUrl: providerForm.baseUrl,
         model: providerForm.model,
         hasApiKey: Boolean(apiKey || providerSettings?.hasApiKey),
@@ -755,12 +782,53 @@ function App() {
     }
   }
 
+  function applyProviderPreset(preset: ProviderPreset) {
+    setProviderForm((current) => ({
+      ...current,
+      provider: preset.provider,
+      baseUrl: preset.baseUrl,
+      model: preset.model,
+      apiKey: '',
+    }))
+    setMessage(`已切换到「${preset.label}」配置。`)
+  }
+
+  async function importDevelopmentApiKey() {
+    setError(null)
+    try {
+      const apiKey = await invoke<string | null>('load_development_api_key', {
+        provider: providerForm.provider,
+      })
+      if (!apiKey) {
+        setMessage('未找到本机测试密钥。请使用环境变量或 secrets/ 本地文件。')
+        return
+      }
+      await saveProviderApiKey(providerForm.provider, apiKey)
+      const settings = await invoke<ProviderSettings>('save_provider_settings', {
+        settings: {
+          provider: providerForm.provider,
+          baseUrl: providerForm.baseUrl,
+          model: providerForm.model,
+          hasApiKey: true,
+        },
+      })
+      setProviderSettings(settings)
+      setProviderForm((current) => ({ ...current, apiKey: '' }))
+      const presets = await invoke<ProviderPreset[]>('get_provider_presets')
+      setProviderPresets(presets)
+      setMessage('已从本机安全位置导入测试密钥。')
+    } catch (reason) {
+      setError(String(reason))
+      setMessage('导入本机测试密钥失败。')
+    }
+  }
+
   async function testProviderConnection() {
     setIsTestingProvider(true)
     setError(null)
     try {
       await persistProviderSettings(false)
-      const apiKey = providerForm.apiKey.trim() || await readProviderApiKey()
+      const apiKey = providerForm.apiKey.trim() || await readProviderApiKey(providerForm.provider)
       const result = await invoke<ProviderConnectionResult>('test_provider_connection', {
         apiKey,
       })
@@ -786,7 +854,7 @@ function App() {
     setError(null)
     setActivePanel('qa')
     try {
-      const apiKey = await readProviderApiKey()
+      const apiKey = await readProviderApiKey(providerSettings?.provider ?? providerForm.provider)
       const run = await invoke<ResearchRun>('index_document', {
         id: selectedDocument.id,
         apiKey,
@@ -813,7 +881,7 @@ function App() {
     setError(null)
     setActivePanel('qa')
     try {
-      const apiKey = await readProviderApiKey()
+      const apiKey = await readProviderApiKey(providerSettings?.provider ?? providerForm.provider)
       const result = await invoke<AskDocumentResult>('ask_document', {
         id: selectedDocument.id,
         question: paperQuestion,
@@ -1386,14 +1454,39 @@ function App() {
           {activePanel === 'settings' ? (
             <section className="settings-panel" aria-label="模型配置">
               <div className="section-heading">
-                <span>OpenAI-compatible Provider</span>
-                <span>{providerSettings?.hasApiKey ? '已保存密钥' : '未保存密钥'}</span>
+                <span>模型服务 Provider</span>
+                <span>
+                  {providerSettings?.provider === providerForm.provider && providerSettings?.hasApiKey
+                    ? '当前 provider 已保存密钥'
+                    : '当前 provider 未保存密钥'}
+                </span>
               </div>
+              <div className="provider-preset-grid">
+                {providerPresets.map((preset) => (
+                  <button
+                    className={providerForm.provider === preset.provider ? 'selected' : ''}
+                    type="button"
+                    key={preset.provider}
+                    onClick={() => applyProviderPreset(preset)}
+                  >
+                    <strong>{preset.label}</strong>
+                    <span>{preset.description}</span>
+                    <small>
+                      {preset.model}
+                      {preset.hasDevelopmentKey ? ' | 本机密钥可用' : ''}
+                    </small>
+                  </button>
+                ))}
+              </div>
+              <label className="form-field">
+                <span>Provider 类型</span>
+                <input value={providerForm.provider} readOnly />
+              </label>
               <label className="form-field">
                 <span>Base URL</span>
                 <input
                   value={providerForm.baseUrl}
-                  placeholder="https://api.openai.com/v1"
+                  placeholder="https://api.deepseek.com"
                   onChange={(event) =>
                     setProviderForm((current) => ({ ...current, baseUrl: event.target.value }))
                   }
@@ -1403,7 +1496,7 @@ function App() {
                 <span>模型</span>
                 <input
                   value={providerForm.model}
-                  placeholder="gpt-4o-mini"
+                  placeholder="deepseek-v4-flash"
                   onChange={(event) =>
                     setProviderForm((current) => ({ ...current, model: event.target.value }))
                   }
@@ -1428,6 +1521,10 @@ function App() {
                 <button type="button" onClick={() => void testProviderConnection()} disabled={isTestingProvider}>
                   {isTestingProvider ? <Loader2 className="spin" size={15} aria-hidden="true" /> : <Sparkles size={15} aria-hidden="true" />}
                   测试连接
+                </button>
+                <button type="button" onClick={() => void importDevelopmentApiKey()}>
+                  <Sparkles size={15} aria-hidden="true" />
+                  导入本机测试密钥
                 </button>
               </div>
             </section>

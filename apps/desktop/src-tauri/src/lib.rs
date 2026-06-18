@@ -67,6 +67,17 @@ pub struct ProviderConnectionResult {
     checked_at: String,
 }
 
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderPreset {
+    provider: String,
+    label: String,
+    description: String,
+    base_url: String,
+    model: String,
+    has_development_key: bool,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ResearchRunLog {
@@ -512,14 +523,102 @@ fn now_string() -> String {
     Utc::now().to_rfc3339()
 }
 
+fn provider_defaults(provider: &str) -> Option<(&'static str, &'static str, &'static str)> {
+    match provider {
+        "openai-compatible" => Some((
+            "OpenAI-compatible",
+            "https://api.openai.com/v1",
+            "gpt-4o-mini",
+        )),
+        "deepseek" => Some((
+            "DeepSeek 官方",
+            "https://api.deepseek.com",
+            "deepseek-v4-flash",
+        )),
+        "test-relay" => Some(("测试中转站", "https://chenghuaai.com/v1", "claude-opus-4-6")),
+        _ => None,
+    }
+}
+
 fn default_provider_settings() -> ProviderSettings {
+    let (_, base_url, model) = provider_defaults("openai-compatible").expect("default provider");
     ProviderSettings {
         provider: "openai-compatible".to_string(),
-        base_url: "https://api.openai.com/v1".to_string(),
-        model: "gpt-4o-mini".to_string(),
+        base_url: base_url.to_string(),
+        model: model.to_string(),
         has_api_key: false,
         updated_at: None,
     }
+}
+
+fn development_key_env_names(provider: &str) -> &'static [&'static str] {
+    match provider {
+        "deepseek" => &["DEEPSEEK_API_KEY", "NOVUM_DEEPSEEK_API_KEY"],
+        "test-relay" => &["NOVUM_TEST_RELAY_API_KEY", "NOVUM_TEST_PROVIDER_API_KEY"],
+        "openai-compatible" => &["OPENAI_API_KEY", "NOVUM_OPENAI_API_KEY"],
+        _ => &[],
+    }
+}
+
+fn development_key_file(provider: &str) -> Result<PathBuf, String> {
+    Ok(repo_root_dir()?
+        .join("secrets")
+        .join(format!("{provider}-api-key.txt")))
+}
+
+fn read_development_api_key(provider: &str) -> Result<Option<String>, String> {
+    for name in development_key_env_names(provider) {
+        if let Ok(value) = std::env::var(name) {
+            let trimmed = value.trim().to_string();
+            if !trimmed.is_empty() {
+                return Ok(Some(trimmed));
+            }
+        }
+    }
+
+    let path = development_key_file(provider)?;
+    if path.is_file() {
+        let value =
+            fs::read_to_string(path).map_err(|error| format!("读取本地测试密钥失败：{error}"))?;
+        let trimmed = value.trim().to_string();
+        if !trimmed.is_empty() {
+            return Ok(Some(trimmed));
+        }
+    }
+
+    Ok(None)
+}
+
+fn provider_presets() -> Result<Vec<ProviderPreset>, String> {
+    Ok(vec![
+        ProviderPreset {
+            provider: "openai-compatible".to_string(),
+            label: "OpenAI-compatible".to_string(),
+            description: "自定义 OpenAI-compatible 服务，适合 OpenAI、Azure 兼容网关或本地代理。"
+                .to_string(),
+            base_url: "https://api.openai.com/v1".to_string(),
+            model: "gpt-4o-mini".to_string(),
+            has_development_key: read_development_api_key("openai-compatible")?.is_some(),
+        },
+        ProviderPreset {
+            provider: "deepseek".to_string(),
+            label: "DeepSeek 官方".to_string(),
+            description: "DeepSeek 官方 OpenAI-compatible API，默认模型 deepseek-v4-flash。"
+                .to_string(),
+            base_url: "https://api.deepseek.com".to_string(),
+            model: "deepseek-v4-flash".to_string(),
+            has_development_key: read_development_api_key("deepseek")?.is_some(),
+        },
+        ProviderPreset {
+            provider: "test-relay".to_string(),
+            label: "测试中转站".to_string(),
+            description: "本地开发测试 preset，默认使用 chenghuaai.com 与 claude-opus-4-6。密钥只从本机环境或 secrets/ 读取。"
+                .to_string(),
+            base_url: "https://chenghuaai.com/v1".to_string(),
+            model: "claude-opus-4-6".to_string(),
+            has_development_key: read_development_api_key("test-relay")?.is_some(),
+        },
+    ])
 }
 
 fn read_provider_settings(connection: &Connection) -> Result<ProviderSettings, String> {
@@ -1120,8 +1219,9 @@ fn save_provider_settings(
     settings: ProviderSettingsInput,
 ) -> Result<ProviderSettings, String> {
     ensure_storage(&app)?;
-    if settings.provider != "openai-compatible" {
-        return Err("Phase 3 仅支持 OpenAI-compatible 模型服务。".to_string());
+    let provider = settings.provider.trim();
+    if provider_defaults(provider).is_none() {
+        return Err("当前仅支持 OpenAI-compatible、DeepSeek 官方和测试中转站。".to_string());
     }
     if settings.base_url.trim().is_empty() {
         return Err("Base URL 不能为空。".to_string());
@@ -1146,7 +1246,7 @@ fn save_provider_settings(
         updated_at = excluded.updated_at
       ",
             params![
-                settings.provider,
+                provider,
                 settings.base_url.trim().trim_end_matches('/').to_string(),
                 settings.model.trim().to_string(),
                 if settings.has_api_key { 1 } else { 0 },
@@ -1159,6 +1259,19 @@ fn save_provider_settings(
 }
 
 #[tauri::command]
+fn get_provider_presets() -> Result<Vec<ProviderPreset>, String> {
+    provider_presets()
+}
+
+#[tauri::command]
+fn load_development_api_key(provider: String) -> Result<Option<String>, String> {
+    if provider_defaults(provider.trim()).is_none() {
+        return Err("未知模型服务类型。".to_string());
+    }
+    read_development_api_key(provider.trim())
+}
+
+#[tauri::command]
 fn test_provider_connection(
     app: AppHandle,
     api_key: String,
@@ -1168,13 +1281,29 @@ fn test_provider_connection(
     let settings = read_provider_settings(&connection)?;
     let provider = provider_payload(&settings, api_key)?;
     let checked_at = now_string();
-    let url = format!("{}/models", provider.base_url.trim_end_matches('/'));
+    let url = format!(
+        "{}/chat/completions",
+        provider.base_url.trim_end_matches('/')
+    );
+    let payload = serde_json::json!({
+        "model": provider.model,
+        "messages": [
+            {
+                "role": "user",
+                "content": "用一句话回复：Novum 模型服务连接成功。"
+            }
+        ],
+        "max_tokens": 32,
+        "stream": false
+    });
     let result = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(20))
         .build()
         .map_err(|error| format!("无法创建模型连接客户端：{error}"))?
-        .get(url)
+        .post(url)
+        .header("Content-Type", "application/json")
         .bearer_auth(provider.api_key)
+        .json(&payload)
         .send();
 
     match result {
@@ -1693,6 +1822,8 @@ pub fn run() {
             list_documents,
             get_document,
             get_provider_settings,
+            get_provider_presets,
+            load_development_api_key,
             save_provider_settings,
             test_provider_connection,
             get_document_pdf_bytes,

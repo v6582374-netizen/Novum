@@ -510,6 +510,42 @@ kbd {
   gap: 8px;
 }
 
+.provider-preset-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 8px;
+}
+
+.provider-preset-grid button {
+  display: grid;
+  gap: 6px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px;
+  color: var(--text);
+  background: var(--surface);
+  text-align: left;
+}
+
+.provider-preset-grid button.selected,
+.provider-preset-grid button:hover {
+  color: var(--text-strong);
+  border-color: var(--accent-border);
+  background: var(--accent-soft);
+}
+
+.provider-preset-grid strong {
+  color: var(--text-strong);
+  font-size: 13px;
+}
+
+.provider-preset-grid span,
+.provider-preset-grid small {
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
 .skill-output {
   display: grid;
   gap: 8px;
