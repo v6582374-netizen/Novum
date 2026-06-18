@@ -180,6 +180,11 @@ const STRONGHOLD_PASSWORD = 'novum-phase3-local-vault'
 const STRONGHOLD_CLIENT = 'novum'
 const LEGACY_PROVIDER_API_KEY = 'openai-compatible-api-key'
 const PROVIDER_API_KEY_PREFIX = 'provider-api-key:'
+const providerApiKeyCache = new Map<ProviderKind, string>()
+let credentialClientPromise: Promise<{
+  stronghold: Stronghold
+  client: Awaited<ReturnType<Stronghold['loadClient']>>
+}> | null = null
 
 const panels: Array<{
   id: PanelId
@@ -208,22 +213,33 @@ function cleanupPdfDocument(document: PDFDocumentProxy | null) {
 
 async function withCredentialStore<T>(
   action: (store: Store) => Promise<T>,
+  options: { save?: boolean } = {},
 ) {
   const { stronghold, client } = await getCredentialClient()
   const result = await action(client.getStore())
-  await stronghold.save()
+  if (options.save) {
+    await stronghold.save()
+  }
   return result
 }
 
 async function getCredentialClient() {
-  const dataDir = await appDataDir()
-  const vaultPath = await join(dataDir, 'novum-credentials.stronghold')
-  const stronghold = await Stronghold.load(vaultPath, STRONGHOLD_PASSWORD)
-  try {
-    return { stronghold, client: await stronghold.loadClient(STRONGHOLD_CLIENT) }
-  } catch {
-    return { stronghold, client: await stronghold.createClient(STRONGHOLD_CLIENT) }
+  if (!credentialClientPromise) {
+    credentialClientPromise = (async () => {
+      const dataDir = await appDataDir()
+      const vaultPath = await join(dataDir, 'novum-credentials.stronghold')
+      const stronghold = await Stronghold.load(vaultPath, STRONGHOLD_PASSWORD)
+      try {
+        return { stronghold, client: await stronghold.loadClient(STRONGHOLD_CLIENT) }
+      } catch {
+        return { stronghold, client: await stronghold.createClient(STRONGHOLD_CLIENT) }
+      }
+    })().catch((reason) => {
+      credentialClientPromise = null
+      throw reason
+    })
   }
+  return credentialClientPromise
 }
 
 function providerApiKeyName(provider: ProviderKind) {
@@ -234,20 +250,51 @@ async function saveProviderApiKey(provider: ProviderKind, apiKey: string) {
   const trimmed = apiKey.trim()
   if (!trimmed) return
 
+  providerApiKeyCache.set(provider, trimmed)
   const encoded = Array.from(new TextEncoder().encode(trimmed))
   await withCredentialStore(async (store) => {
     await store.insert(providerApiKeyName(provider), encoded)
-  })
+  }, { save: true })
+}
+
+async function readDevelopmentApiKey(provider: ProviderKind) {
+  return invoke<string | null>('load_development_api_key', { provider })
 }
 
 async function readProviderApiKey(provider: ProviderKind) {
+  const cached = providerApiKeyCache.get(provider)
+  if (cached) return cached
+
+  if (provider === 'test-relay') {
+    const developmentKey = await readDevelopmentApiKey(provider)
+    if (developmentKey) {
+      providerApiKeyCache.set(provider, developmentKey)
+      return developmentKey
+    }
+  }
+
   return withCredentialStore(async (store) => {
     const value = await store.get(providerApiKeyName(provider))
     if (!value && provider === 'openai-compatible') {
       const legacyValue = await store.get(LEGACY_PROVIDER_API_KEY)
-      return legacyValue ? new TextDecoder().decode(legacyValue) : ''
+      if (legacyValue) {
+        const decoded = new TextDecoder().decode(legacyValue)
+        providerApiKeyCache.set(provider, decoded)
+        return decoded
+      }
     }
-    return value ? new TextDecoder().decode(value) : ''
+    if (value) {
+      const decoded = new TextDecoder().decode(value)
+      providerApiKeyCache.set(provider, decoded)
+      return decoded
+    }
+
+    const developmentKey = await readDevelopmentApiKey(provider)
+    if (developmentKey) {
+      providerApiKeyCache.set(provider, developmentKey)
+      return developmentKey
+    }
+    return ''
   })
 }
 
@@ -748,6 +795,8 @@ function App() {
 
   async function persistProviderSettings(showSuccess = true) {
     const apiKey = providerForm.apiKey.trim()
+    const hasCurrentProviderKey =
+      providerSettings?.provider === providerForm.provider && providerSettings.hasApiKey
     if (apiKey) {
       setProviderOperationMessage('正在把 API Key 写入本地 Stronghold。')
       await saveProviderApiKey(providerForm.provider, apiKey)
@@ -759,7 +808,7 @@ function App() {
         provider: providerForm.provider,
         baseUrl: providerForm.baseUrl,
         model: providerForm.model,
-        hasApiKey: Boolean(apiKey || providerSettings?.hasApiKey),
+        hasApiKey: Boolean(apiKey || hasCurrentProviderKey || providerApiKeyCache.has(providerForm.provider)),
       },
     })
     setProviderSettings(settings)
@@ -802,17 +851,14 @@ function App() {
     setError(null)
     setProviderOperationMessage('正在查找内置/本机测试密钥。')
     try {
-      const apiKey = await invoke<string | null>('load_development_api_key', {
-        provider: providerForm.provider,
-      })
+      const apiKey = await readDevelopmentApiKey(providerForm.provider)
       if (!apiKey) {
         setProviderOperationMessage('未找到本机测试密钥。')
         setMessage('未找到本机测试密钥。请使用环境变量或 secrets/ 本地文件。')
         return
       }
-      setProviderOperationMessage('已找到测试密钥，正在写入本地 Stronghold。')
-      await saveProviderApiKey(providerForm.provider, apiKey)
-      setProviderOperationMessage('正在保存当前 provider 配置。')
+      providerApiKeyCache.set(providerForm.provider, apiKey)
+      setProviderOperationMessage('已找到测试密钥，正在保存当前 provider 配置。')
       const settings = await invoke<ProviderSettings>('save_provider_settings', {
         settings: {
           provider: providerForm.provider,
@@ -825,8 +871,8 @@ function App() {
       setProviderForm((current) => ({ ...current, apiKey: '' }))
       const presets = await invoke<ProviderPreset[]>('get_provider_presets')
       setProviderPresets(presets)
-      setProviderOperationMessage('测试密钥已导入并保存。')
-      setMessage('已从本机安全位置导入测试密钥。')
+      setProviderOperationMessage('测试密钥已载入运行时缓存，provider 配置已保存。')
+      setMessage('已从本机安全位置载入测试密钥。')
     } catch (reason) {
       setError(String(reason))
       setProviderOperationMessage('导入本机测试密钥失败。')
@@ -842,6 +888,7 @@ function App() {
     setProviderOperationMessage('正在保存配置并准备发起模型连接测试。')
     try {
       await persistProviderSettings(false)
+      setProviderOperationMessage('正在读取当前 provider 的 API Key。')
       const apiKey = providerForm.apiKey.trim() || await readProviderApiKey(providerForm.provider)
       setProviderOperationMessage(
         `正在请求 ${providerForm.baseUrl.replace(/\/$/, '')}/chat/completions，最多等待 20 秒。`,
