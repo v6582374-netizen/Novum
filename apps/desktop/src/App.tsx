@@ -116,30 +116,58 @@ type AskDocumentResult = {
   answer: QaAnswer
 }
 
+type SkillInputSpec = {
+  name: string
+  label: string
+  type: 'text' | 'textarea' | 'file' | 'select' | 'number' | 'boolean'
+  required: boolean
+  defaultValue: string | number | boolean | null
+  help: string | null
+}
+
+type ScienceSkill = {
+  id: string
+  name: string
+  description: string
+  domain: string
+  source: 'science-skills'
+  sourcePath: string
+  upstreamCommit: string
+  requiredInputs: SkillInputSpec[]
+  requiredEnv: string[]
+  executionMode: 'python' | 'prompt' | 'hybrid'
+  status: '可用' | '缺少依赖' | '需要配置' | '不可用'
+  updatedAt: string
+}
+
+type SkillRun = {
+  id: string
+  skillId: string
+  skillName: string
+  status: 'queued' | 'running' | 'succeeded' | 'failed'
+  startedAt: string
+  finishedAt: string | null
+  error: string | null
+  logs: Array<{
+    timestamp: string
+    level: 'info' | 'warning' | 'error'
+    message: string
+  }>
+  outputs: Array<{
+    id: string
+    kind: 'markdown' | 'json' | 'file' | 'text'
+    title: string
+    content: string
+    filePath: string | null
+  }>
+}
+
 const DEFAULT_PDF_PANE_WIDTH = 520
 const MIN_PDF_PANE_WIDTH = 420
 const MAX_PDF_PANE_WIDTH = 900
 const STRONGHOLD_PASSWORD = 'novum-phase3-local-vault'
 const STRONGHOLD_CLIENT = 'novum'
 const PROVIDER_API_KEY = 'openai-compatible-api-key'
-
-const skills = [
-  {
-    name: 'AlphaGenome 检索',
-    domain: '基因组学',
-    state: '待接入',
-  },
-  {
-    name: 'UniProt 证据提取',
-    domain: '生物学',
-    state: '待接入',
-  },
-  {
-    name: 'AFDB 结构搜索',
-    domain: '蛋白质',
-    state: '待接入',
-  },
-]
 
 const panels: Array<{
   id: PanelId
@@ -290,13 +318,20 @@ function App() {
   const [documents, setDocuments] = useState<DocumentRecord[]>([])
   const [selectedDocumentId, setSelectedDocumentId] = useState<string | null>(null)
   const [documentQuery, setDocumentQuery] = useState('')
-  const [selectedSkillIndex, setSelectedSkillIndex] = useState(0)
+  const [skills, setSkills] = useState<ScienceSkill[]>([])
+  const [selectedSkillId, setSelectedSkillId] = useState<string | null>(null)
+  const [skillQuery, setSkillQuery] = useState('')
+  const [skillDomain, setSkillDomain] = useState('全部')
+  const [skillInputs, setSkillInputs] = useState<Record<string, string>>({ task: '' })
+  const [latestSkillRun, setLatestSkillRun] = useState<SkillRun | null>(null)
   const [currentPage, setCurrentPage] = useState(1)
   const [zoom, setZoom] = useState(100)
   const [pdfDocument, setPdfDocument] = useState<PDFDocumentProxy | null>(null)
   const [isLoadingLibrary, setIsLoadingLibrary] = useState(true)
+  const [isLoadingSkills, setIsLoadingSkills] = useState(true)
   const [isImporting, setIsImporting] = useState(false)
   const [isLoadingPdf, setIsLoadingPdf] = useState(false)
+  const [isRunningSkill, setIsRunningSkill] = useState(false)
   const [isPdfCollapsed, setIsPdfCollapsed] = useState(false)
   const [isResizingPdf, setIsResizingPdf] = useState(false)
   const [pdfPaneWidth, setPdfPaneWidth] = useState(DEFAULT_PDF_PANE_WIDTH)
@@ -324,7 +359,11 @@ function App() {
     () => documents.find((document) => document.id === selectedDocumentId) ?? null,
     [documents, selectedDocumentId],
   )
-  const selectedSkill = skills[selectedSkillIndex]
+  const selectedSkill = useMemo(
+    () => skills.find((skill) => skill.id === selectedSkillId) ?? skills[0] ?? null,
+    [selectedSkillId, skills],
+  )
+  const visibleSkillRun = latestSkillRun?.skillId === selectedSkill?.id ? latestSkillRun : null
   const isProviderReady = Boolean(providerSettings?.hasApiKey)
   const pdfPageCount = pdfDocument?.numPages ?? selectedDocument?.pageCount ?? 0
   const pdfPageNumbers = useMemo(
@@ -396,6 +435,29 @@ function App() {
     })
   }, [documentQuery, documents])
 
+  const skillDomains = useMemo(
+    () => ['全部', ...Array.from(new Set(skills.map((skill) => skill.domain))).sort()],
+    [skills],
+  )
+
+  const filteredSkills = useMemo(() => {
+    const query = skillQuery.trim().toLocaleLowerCase()
+    return skills.filter((skill) => {
+      const matchesDomain = skillDomain === '全部' || skill.domain === skillDomain
+      const searchableText = [
+        skill.name,
+        skill.id,
+        skill.description,
+        skill.domain,
+        skill.status,
+        skill.executionMode,
+      ]
+        .join(' ')
+        .toLocaleLowerCase()
+      return matchesDomain && (!query || searchableText.includes(query))
+    })
+  }, [skillDomain, skillQuery, skills])
+
   const selectDocumentState = useCallback((document: DocumentRecord | null) => {
     setSelectedDocumentId(document?.id ?? null)
     if (!document) {
@@ -431,9 +493,32 @@ function App() {
     }
   }, [selectDocumentState])
 
+  const loadSkills = useCallback(async (preferredSkillId?: string | null) => {
+    setIsLoadingSkills(true)
+    setError(null)
+    try {
+      const registry = await invoke<ScienceSkill[]>('list_skills')
+      setSkills(registry)
+      setSelectedSkillId((current) => {
+        const targetId = preferredSkillId ?? current
+        return registry.find((skill) => skill.id === targetId)?.id ?? registry[0]?.id ?? null
+      })
+      setMessage(registry.length ? '已载入 Science Skills 注册表。' : '技能注册表为空。')
+    } catch (reason) {
+      setError(String(reason))
+      setMessage('读取科学技能注册表失败。')
+    } finally {
+      setIsLoadingSkills(false)
+    }
+  }, [])
+
   useEffect(() => {
     void Promise.resolve().then(() => loadDocuments())
   }, [loadDocuments])
+
+  useEffect(() => {
+    void Promise.resolve().then(() => loadSkills())
+  }, [loadSkills])
 
   useEffect(() => {
     async function loadProviderSettings() {
@@ -769,15 +854,44 @@ function App() {
     setMessage('请先为当前文献建立 PaperQA 索引。')
   }
 
-  function selectSkill(index: number) {
-    setSelectedSkillIndex(index)
+  function selectSkill(skill: ScienceSkill) {
+    setSelectedSkillId(skill.id)
     setActivePanel('skills')
-    setMessage(`已选中技能「${skills[index].name}」。技能执行器将在后续阶段接入。`)
+    setMessage(`已选中技能「${skill.name}」。`)
   }
 
-  function runSkill() {
+  async function runSkill() {
     setActivePanel('skills')
-    setMessage(`「${selectedSkill.name}」尚未接入真实执行器。`)
+    if (!selectedSkill) {
+      setMessage('请先选择一个科学技能。')
+      return
+    }
+    if (!skillInputs.task?.trim()) {
+      setMessage('请先填写技能任务上下文。')
+      return
+    }
+
+    setIsRunningSkill(true)
+    setError(null)
+    try {
+      const run = await invoke<SkillRun>('run_skill', {
+        id: selectedSkill.id,
+        inputs: skillInputs,
+        activeDocumentId: selectedDocument?.id ?? null,
+      })
+      setLatestSkillRun(run)
+      if (run.status === 'failed') {
+        setError(run.error ?? '技能运行失败。')
+        setMessage('技能运行失败。')
+      } else {
+        setMessage(`技能「${selectedSkill.name}」dry-run 已完成。`)
+      }
+    } catch (reason) {
+      setError(String(reason))
+      setMessage('技能运行失败。')
+    } finally {
+      setIsRunningSkill(false)
+    }
   }
 
   function jumpToPage(page: number) {
@@ -984,32 +1098,64 @@ function App() {
             <button
               className="icon-button"
               type="button"
-              title="搜索技能"
-              onClick={() => {
-                setActivePanel('skills')
-                setMessage('技能搜索将在 science-skills 注册表接入后启用。')
-              }}
+              title="刷新技能"
+              onClick={() => void loadSkills(selectedSkill?.id)}
+              disabled={isLoadingSkills}
             >
-              <Search size={15} aria-hidden="true" />
+              {isLoadingSkills ? (
+                <Loader2 className="spin" size={15} aria-hidden="true" />
+              ) : (
+                <Search size={15} aria-hidden="true" />
+              )}
             </button>
           </div>
+          <label className="library-search">
+            <Search size={14} aria-hidden="true" />
+            <input
+              type="search"
+              value={skillQuery}
+              placeholder="查找技能、领域或状态"
+              aria-label="查找科学技能"
+              onChange={(event) => setSkillQuery(event.target.value)}
+            />
+          </label>
+          <label className="library-search">
+            <FlaskConical size={14} aria-hidden="true" />
+            <select
+              value={skillDomain}
+              aria-label="按领域筛选技能"
+              onChange={(event) => setSkillDomain(event.target.value)}
+            >
+              {skillDomains.map((domain) => (
+                <option key={domain} value={domain}>
+                  {domain}
+                </option>
+              ))}
+            </select>
+          </label>
           <div className="skill-list">
-            {skills.map((skill, index) => (
-              <button
-                className={`skill-row ${index === selectedSkillIndex ? 'selected' : ''}`}
-                key={skill.name}
-                type="button"
-                onClick={() => selectSkill(index)}
-              >
-                <span>
-                  <strong>{skill.name}</strong>
-                  <small>
-                    {skill.domain} | {skill.state}
-                  </small>
-                </span>
-                <ChevronRight size={15} aria-hidden="true" />
-              </button>
-            ))}
+            {isLoadingSkills ? (
+              <div className="empty-state compact">正在读取技能注册表...</div>
+            ) : filteredSkills.length ? (
+              filteredSkills.map((skill) => (
+                <button
+                  className={`skill-row ${skill.id === selectedSkill?.id ? 'selected' : ''}`}
+                  key={skill.id}
+                  type="button"
+                  onClick={() => selectSkill(skill)}
+                >
+                  <span>
+                    <strong>{skill.name}</strong>
+                    <small>
+                      {skill.domain} | {skill.status} | {skill.executionMode}
+                    </small>
+                  </span>
+                  <ChevronRight size={15} aria-hidden="true" />
+                </button>
+              ))
+            ) : (
+              <div className="empty-state compact">没有找到匹配技能。</div>
+            )}
           </div>
         </section>
       </aside>
@@ -1072,9 +1218,21 @@ function App() {
               <button type="button" onClick={() => selectPanel('skills')}>
                 打开技能市场
               </button>
-              <button type="button" onClick={runSkill}>
+              <button type="button" onClick={() => void runSkill()} disabled={!selectedSkill}>
                 运行当前技能
               </button>
+              {filteredSkills.slice(0, 4).map((skill) => (
+                <button
+                  type="button"
+                  key={skill.id}
+                  onClick={() => {
+                    selectSkill(skill)
+                    setIsCommandOpen(false)
+                  }}
+                >
+                  打开：{skill.name}
+                </button>
+              ))}
             </div>
           </section>
         ) : null}
@@ -1113,6 +1271,117 @@ function App() {
           <div className="message-line" aria-live="polite">
             {error ?? message}
           </div>
+
+          {activePanel === 'skills' ? (
+            <section className="skill-detail-panel" aria-label="科学技能详情">
+              {selectedSkill ? (
+                <>
+                  <div className="section-heading">
+                    <span>{selectedSkill.name}</span>
+                    <span>{selectedSkill.status}</span>
+                  </div>
+                  <p>{selectedSkill.description}</p>
+                  <div className="skill-meta-grid">
+                    <span>领域：{selectedSkill.domain}</span>
+                    <span>模式：{selectedSkill.executionMode}</span>
+                    <span>来源：{selectedSkill.source}</span>
+                    <span>Commit：{selectedSkill.upstreamCommit.slice(0, 8)}</span>
+                  </div>
+                  {selectedSkill.requiredEnv.length ? (
+                    <div className="dependency-note">
+                      需要配置：{selectedSkill.requiredEnv.join('、')}
+                    </div>
+                  ) : null}
+                  <div className="skill-input-grid">
+                    {selectedSkill.requiredInputs.map((input) => (
+                      <label className="form-field" key={input.name}>
+                        <span>
+                          {input.label}
+                          {input.required ? ' *' : ''}
+                        </span>
+                        {input.type === 'textarea' ? (
+                          <textarea
+                            value={skillInputs[input.name] ?? ''}
+                            placeholder={input.help ?? '输入技能任务上下文'}
+                            onChange={(event) =>
+                              setSkillInputs((current) => ({
+                                ...current,
+                                [input.name]: event.target.value,
+                              }))
+                            }
+                          />
+                        ) : (
+                          <input
+                            value={skillInputs[input.name] ?? ''}
+                            placeholder={input.help ?? input.label}
+                            onChange={(event) =>
+                              setSkillInputs((current) => ({
+                                ...current,
+                                [input.name]: event.target.value,
+                              }))
+                            }
+                          />
+                        )}
+                      </label>
+                    ))}
+                  </div>
+                  <div className="form-actions">
+                    <button
+                      type="button"
+                      onClick={() => void runSkill()}
+                      disabled={isRunningSkill || !selectedSkill}
+                    >
+                      {isRunningSkill ? (
+                        <Loader2 className="spin" size={15} aria-hidden="true" />
+                      ) : (
+                        <Play size={15} aria-hidden="true" />
+                      )}
+                      运行 dry-run
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void loadSkills(selectedSkill.id)}
+                      disabled={isLoadingSkills}
+                    >
+                      {isLoadingSkills ? (
+                        <Loader2 className="spin" size={15} aria-hidden="true" />
+                      ) : (
+                        <Search size={15} aria-hidden="true" />
+                      )}
+                      刷新 registry
+                    </button>
+                  </div>
+                  {visibleSkillRun ? (
+                    <div className="skill-run-panel">
+                      <div className="section-heading">
+                        <span>运行记录</span>
+                        <span>{visibleSkillRun.status}</span>
+                      </div>
+                      <div className="skill-log-list">
+                        {visibleSkillRun.logs.map((log) => (
+                          <span className={log.level} key={`${log.timestamp}-${log.message}`}>
+                            {log.level} | {log.message}
+                          </span>
+                        ))}
+                      </div>
+                      {visibleSkillRun.outputs.map((output) => (
+                        <article className="skill-output" key={output.id}>
+                          <strong>{output.title}</strong>
+                          <pre>{output.content}</pre>
+                        </article>
+                      ))}
+                    </div>
+                  ) : null}
+                </>
+              ) : (
+                <div className="empty-state">
+                  <FlaskConical size={24} aria-hidden="true" />
+                  <strong>尚未载入科学技能</strong>
+                  <span>请确认本地研究服务可启动，并刷新技能注册表。</span>
+                </div>
+              )}
+            </section>
+          ) : null}
 
           {activePanel === 'settings' ? (
             <section className="settings-panel" aria-label="模型配置">
@@ -1245,13 +1514,13 @@ function App() {
           </article>
           <article>
             <p className="eyebrow">当前阶段</p>
-            <h3>真实 PDF 预览</h3>
-            <p>右侧使用 PDF.js 渲染真实页面，并支持页码与缩放。</p>
+            <h3>科学技能市场</h3>
+            <p>从 science-skills 读取真实技能，支持搜索、筛选和 dry-run。</p>
           </article>
           <article>
             <p className="eyebrow">下一步</p>
-            <h3>论文问答适配器</h3>
-            <p>基于文献 ID 接入 PaperQA 索引、问答与引用跳转。</p>
+            <h3>受控技能执行器</h3>
+            <p>在白名单 runner 中执行技能脚本，记录日志和结构化产物。</p>
           </article>
         </section>
       </section>
@@ -1375,7 +1644,7 @@ function App() {
             <PanelRight size={15} aria-hidden="true" />
             同步引用
           </button>
-          <button type="button" onClick={runSkill}>
+          <button type="button" onClick={() => void runSkill()} disabled={!selectedSkill}>
             <Play size={15} aria-hidden="true" />
             运行技能
           </button>

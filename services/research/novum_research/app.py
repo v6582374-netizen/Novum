@@ -14,10 +14,19 @@ from .schemas import (
     AskDocumentResponse,
     IndexDocumentRequest,
     IndexDocumentResponse,
+    ListSkillsResponse,
     ResearchHealth,
     ResearchRun,
     ResearchRunLog,
+    RunSkillRequest,
+    RunSkillResponse,
+    ScienceSkill,
+    SkillRun,
 )
+from .skill_registry import get_skill as registry_get_skill
+from .skill_registry import list_skills as registry_list_skills
+from .skill_runner import get_run as get_skill_runner_run
+from .skill_runner import run_skill as run_science_skill
 
 app = FastAPI(title="Novum Research Service", version=__version__)
 RUNS: dict[str, ResearchRun] = {}
@@ -109,4 +118,33 @@ async def get_run(run_id: str) -> ResearchRun:
     run = RUNS.get(run_id)
     if not run:
         raise HTTPException(status_code=404, detail="找不到研究任务。")
+    return run
+
+
+@app.get("/skills", response_model=ListSkillsResponse)
+async def list_skills() -> ListSkillsResponse:
+    return ListSkillsResponse(skills=registry_list_skills())
+
+
+@app.get("/skills/{skill_id}", response_model=ScienceSkill)
+async def get_skill(skill_id: str) -> ScienceSkill:
+    try:
+        return registry_get_skill(skill_id)
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="找不到这个科学技能。") from error
+
+
+@app.post("/skills/{skill_id}/run", response_model=RunSkillResponse)
+async def run_skill(skill_id: str, request: RunSkillRequest) -> RunSkillResponse:
+    try:
+        return RunSkillResponse(run=run_science_skill(skill_id, request))
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="找不到这个科学技能。") from error
+
+
+@app.get("/skill-runs/{run_id}", response_model=SkillRun)
+async def get_skill_run(run_id: str) -> SkillRun:
+    run = get_skill_runner_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="找不到技能运行记录。")
     return run

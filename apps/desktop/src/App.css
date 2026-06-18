@@ -205,7 +205,8 @@ kbd {
   color: var(--text-strong);
 }
 
-.library-search input {
+.library-search input,
+.library-search select {
   width: 100%;
   min-width: 0;
   border: 0;
@@ -217,6 +218,10 @@ kbd {
 
 .library-search input::placeholder {
   color: var(--text-muted);
+}
+
+.library-search select {
+  appearance: none;
 }
 
 .paper-item {
@@ -431,7 +436,8 @@ kbd {
 
 .settings-panel,
 .paperqa-panel,
-.qa-answer-card {
+.qa-answer-card,
+.skill-detail-panel {
   display: grid;
   gap: 12px;
   border: 1px solid var(--border);
@@ -449,7 +455,8 @@ kbd {
 }
 
 .form-field input,
-.paperqa-panel textarea {
+.paperqa-panel textarea,
+.skill-detail-panel textarea {
   width: 100%;
   min-width: 0;
   border: 1px solid var(--border);
@@ -462,13 +469,74 @@ kbd {
 }
 
 .form-field input:focus,
-.paperqa-panel textarea:focus {
+.paperqa-panel textarea:focus,
+.skill-detail-panel textarea:focus {
   border-color: var(--accent-border);
 }
 
-.paperqa-panel textarea {
+.paperqa-panel textarea,
+.skill-detail-panel textarea {
   min-height: 92px;
   resize: vertical;
+}
+
+.skill-meta-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 8px;
+}
+
+.skill-meta-grid span,
+.dependency-note,
+.skill-log-list span {
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 8px;
+  color: var(--text);
+  background: var(--surface);
+  font-size: 12px;
+}
+
+.dependency-note {
+  color: #fde68a;
+  border-color: rgba(245, 158, 11, 0.36);
+  background: rgba(245, 158, 11, 0.08);
+}
+
+.skill-input-grid,
+.skill-run-panel,
+.skill-log-list {
+  display: grid;
+  gap: 8px;
+}
+
+.skill-output {
+  display: grid;
+  gap: 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+  background: var(--surface);
+}
+
+.skill-output strong {
+  color: var(--text-strong);
+  font-size: 13px;
+}
+
+.skill-output pre {
+  overflow: auto;
+  max-height: 360px;
+  margin: 0;
+  white-space: pre-wrap;
+  color: var(--text);
+  font: 12px/1.55 var(--mono);
+}
+
+.skill-log-list span.error {
+  color: #fecaca;
+  border-color: rgba(239, 68, 68, 0.42);
+  background: rgba(239, 68, 68, 0.08);
 }
 
 .form-actions {

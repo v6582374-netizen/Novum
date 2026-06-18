@@ -128,7 +128,6 @@ struct ResearchProcessState {
 #[serde(rename_all = "camelCase")]
 struct ResearchHealth {
     ok: bool,
-    paperqa_available: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -169,6 +168,93 @@ struct AskDocumentPayload {
     index_path: String,
     question: String,
     provider: ProviderPayload,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillInputSpec {
+    name: String,
+    label: String,
+    #[serde(rename = "type")]
+    input_type: String,
+    required: bool,
+    default_value: Option<serde_json::Value>,
+    help: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ScienceSkill {
+    id: String,
+    name: String,
+    description: String,
+    domain: String,
+    source: String,
+    source_path: String,
+    upstream_commit: String,
+    required_inputs: Vec<SkillInputSpec>,
+    required_env: Vec<String>,
+    execution_mode: String,
+    status: String,
+    updated_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListSkillsResponse {
+    skills: Vec<ScienceSkill>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillRunLog {
+    timestamp: String,
+    level: String,
+    message: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillRunOutput {
+    id: String,
+    kind: String,
+    title: String,
+    content: String,
+    file_path: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillRun {
+    id: String,
+    skill_id: String,
+    skill_name: String,
+    status: String,
+    started_at: String,
+    finished_at: Option<String>,
+    error: Option<String>,
+    logs: Vec<SkillRunLog>,
+    outputs: Vec<SkillRunOutput>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SkillRunContext {
+    active_document_id: Option<String>,
+    active_document_path: Option<String>,
+    selected_text: Option<String>,
+    provider: Option<ProviderPayload>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RunSkillPayload {
+    inputs: serde_json::Value,
+    context: SkillRunContext,
+}
+
+#[derive(Debug, Deserialize)]
+struct RunSkillResponse {
+    run: SkillRun,
 }
 
 fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
@@ -264,6 +350,42 @@ fn ensure_storage(app: &AppHandle) -> Result<(), String> {
         position INTEGER NOT NULL,
         FOREIGN KEY(thread_id) REFERENCES qa_threads(id) ON DELETE CASCADE,
         FOREIGN KEY(document_id) REFERENCES documents(id) ON DELETE CASCADE
+      );
+      CREATE TABLE IF NOT EXISTS skills_cache (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        description TEXT NOT NULL,
+        domain TEXT NOT NULL,
+        source TEXT NOT NULL,
+        source_path TEXT NOT NULL,
+        upstream_commit TEXT NOT NULL,
+        execution_mode TEXT NOT NULL,
+        status TEXT NOT NULL,
+        required_inputs_json TEXT NOT NULL,
+        required_env_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS skill_runs (
+        id TEXT PRIMARY KEY,
+        skill_id TEXT NOT NULL,
+        skill_name TEXT NOT NULL,
+        status TEXT NOT NULL,
+        inputs_json TEXT NOT NULL,
+        context_json TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        finished_at TEXT,
+        error TEXT,
+        logs_json TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS skill_run_outputs (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        title TEXT NOT NULL,
+        content TEXT NOT NULL,
+        file_path TEXT,
+        position INTEGER NOT NULL,
+        FOREIGN KEY(run_id) REFERENCES skill_runs(id) ON DELETE CASCADE
       );
       ",
         )
@@ -440,12 +562,7 @@ fn provider_payload(
 }
 
 fn research_service_dir() -> Result<PathBuf, String> {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    manifest_dir
-        .ancestors()
-        .nth(3)
-        .map(|root| root.join("services").join("research"))
-        .ok_or_else(|| "无法定位本地研究服务目录。".to_string())
+    Ok(repo_root_dir()?.join("services").join("research"))
 }
 
 fn free_local_port() -> Result<u16, String> {
@@ -468,8 +585,17 @@ fn check_research_health(port: u16) -> bool {
         .and_then(|client| client.get(service_url(port, "/health")).send())
         .and_then(|response| response.error_for_status())
         .and_then(|response| response.json::<ResearchHealth>())
-        .map(|health| health.ok && health.paperqa_available)
+        .map(|health| health.ok)
         .unwrap_or(false)
+}
+
+fn repo_root_dir() -> Result<PathBuf, String> {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    manifest_dir
+        .ancestors()
+        .nth(3)
+        .map(Path::to_path_buf)
+        .ok_or_else(|| "无法定位项目根目录。".to_string())
 }
 
 fn ensure_research_service(
@@ -487,6 +613,7 @@ fn ensure_research_service(
     }
 
     let service_dir = research_service_dir()?;
+    let repo_root = repo_root_dir()?;
     if !service_dir.exists() {
         return Err("找不到 services/research，本地研究服务尚未初始化。".to_string());
     }
@@ -513,6 +640,7 @@ fn ensure_research_service(
         .current_dir(&service_dir)
         .env("PYTHONPATH", &service_dir)
         .env("NOVUM_APP_DATA_DIR", app_data)
+        .env("NOVUM_REPO_ROOT", repo_root)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -543,7 +671,7 @@ fn ensure_research_service(
         thread::sleep(Duration::from_millis(200));
     }
 
-    Err("本地研究服务已启动但未就绪。请确认 services/research 已安装 PaperQA 依赖。".to_string())
+    Err("本地研究服务已启动但未就绪。请确认 services/research 已安装 Python 依赖。".to_string())
 }
 
 fn make_run(kind: &str, document_id: &str, message: &str) -> ResearchRun {
@@ -663,6 +791,231 @@ fn extract_service_error(response: reqwest::blocking::Response) -> String {
             .unwrap_or_else(|| format!("研究服务返回错误 {status}：{text}")),
         _ => format!("研究服务返回错误 {status}。"),
     }
+}
+
+fn persist_skill_cache(connection: &Connection, skill: &ScienceSkill) -> Result<(), String> {
+    let required_inputs_json = serde_json::to_string(&skill.required_inputs)
+        .map_err(|error| format!("序列化技能输入失败：{error}"))?;
+    let required_env_json = serde_json::to_string(&skill.required_env)
+        .map_err(|error| format!("序列化技能环境变量失败：{error}"))?;
+
+    connection
+        .execute(
+            "
+      INSERT INTO skills_cache (
+        id, name, description, domain, source, source_path, upstream_commit,
+        execution_mode, status, required_inputs_json, required_env_json, updated_at
+      )
+      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+      ON CONFLICT(id) DO UPDATE SET
+        name = excluded.name,
+        description = excluded.description,
+        domain = excluded.domain,
+        source = excluded.source,
+        source_path = excluded.source_path,
+        upstream_commit = excluded.upstream_commit,
+        execution_mode = excluded.execution_mode,
+        status = excluded.status,
+        required_inputs_json = excluded.required_inputs_json,
+        required_env_json = excluded.required_env_json,
+        updated_at = excluded.updated_at
+      ",
+            params![
+                skill.id,
+                skill.name,
+                skill.description,
+                skill.domain,
+                skill.source,
+                skill.source_path,
+                skill.upstream_commit,
+                skill.execution_mode,
+                skill.status,
+                required_inputs_json,
+                required_env_json,
+                skill.updated_at
+            ],
+        )
+        .map_err(|error| format!("保存技能缓存失败：{error}"))?;
+    Ok(())
+}
+
+fn row_to_science_skill(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScienceSkill> {
+    let required_inputs_json: String = row.get(9)?;
+    let required_env_json: String = row.get(10)?;
+    Ok(ScienceSkill {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        description: row.get(2)?,
+        domain: row.get(3)?,
+        source: row.get(4)?,
+        source_path: row.get(5)?,
+        upstream_commit: row.get(6)?,
+        execution_mode: row.get(7)?,
+        status: row.get(8)?,
+        required_inputs: serde_json::from_str(&required_inputs_json).unwrap_or_default(),
+        required_env: serde_json::from_str(&required_env_json).unwrap_or_default(),
+        updated_at: row.get(11)?,
+    })
+}
+
+fn get_cached_skill(connection: &Connection, id: &str) -> Result<Option<ScienceSkill>, String> {
+    connection
+        .query_row(
+            "
+      SELECT id, name, description, domain, source, source_path, upstream_commit,
+             execution_mode, status, required_inputs_json, required_env_json, updated_at
+      FROM skills_cache
+      WHERE id = ?1
+      ",
+            [id],
+            row_to_science_skill,
+        )
+        .optional()
+        .map_err(|error| format!("读取技能缓存失败：{error}"))
+}
+
+fn persist_skill_run(
+    connection: &Connection,
+    run: &SkillRun,
+    inputs_json: &str,
+    context_json: &str,
+) -> Result<(), String> {
+    let logs_json =
+        serde_json::to_string(&run.logs).map_err(|error| format!("序列化技能日志失败：{error}"))?;
+    connection
+        .execute(
+            "
+      INSERT INTO skill_runs (
+        id, skill_id, skill_name, status, inputs_json, context_json,
+        started_at, finished_at, error, logs_json
+      )
+      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+      ON CONFLICT(id) DO UPDATE SET
+        status = excluded.status,
+        finished_at = excluded.finished_at,
+        error = excluded.error,
+        logs_json = excluded.logs_json
+      ",
+            params![
+                run.id,
+                run.skill_id,
+                run.skill_name,
+                run.status,
+                inputs_json,
+                context_json,
+                run.started_at,
+                run.finished_at,
+                run.error,
+                logs_json
+            ],
+        )
+        .map_err(|error| format!("保存技能运行记录失败：{error}"))?;
+
+    connection
+        .execute("DELETE FROM skill_run_outputs WHERE run_id = ?1", [&run.id])
+        .map_err(|error| format!("清理技能输出失败：{error}"))?;
+    for (index, output) in run.outputs.iter().enumerate() {
+        connection
+            .execute(
+                "
+        INSERT INTO skill_run_outputs (
+          id, run_id, kind, title, content, file_path, position
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        ",
+                params![
+                    output.id,
+                    run.id,
+                    output.kind,
+                    output.title,
+                    output.content,
+                    output.file_path,
+                    index as i64
+                ],
+            )
+            .map_err(|error| format!("保存技能输出失败：{error}"))?;
+    }
+
+    Ok(())
+}
+
+fn get_skill_run_from_connection(connection: &Connection, id: &str) -> Result<SkillRun, String> {
+    let mut run = connection
+        .query_row(
+            "
+      SELECT id, skill_id, skill_name, status, started_at, finished_at, error, logs_json
+      FROM skill_runs
+      WHERE id = ?1
+      ",
+            [id],
+            |row| {
+                let logs_json: String = row.get(7)?;
+                Ok(SkillRun {
+                    id: row.get(0)?,
+                    skill_id: row.get(1)?,
+                    skill_name: row.get(2)?,
+                    status: row.get(3)?,
+                    started_at: row.get(4)?,
+                    finished_at: row.get(5)?,
+                    error: row.get(6)?,
+                    logs: serde_json::from_str(&logs_json).unwrap_or_default(),
+                    outputs: Vec::new(),
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| format!("读取技能运行记录失败：{error}"))?
+        .ok_or_else(|| "找不到技能运行记录。".to_string())?;
+
+    let mut statement = connection
+        .prepare(
+            "
+      SELECT id, kind, title, content, file_path
+      FROM skill_run_outputs
+      WHERE run_id = ?1
+      ORDER BY position ASC
+      ",
+        )
+        .map_err(|error| format!("读取技能输出失败：{error}"))?;
+    let rows = statement
+        .query_map([id], |row| {
+            Ok(SkillRunOutput {
+                id: row.get(0)?,
+                kind: row.get(1)?,
+                title: row.get(2)?,
+                content: row.get(3)?,
+                file_path: row.get(4)?,
+            })
+        })
+        .map_err(|error| format!("读取技能输出列表失败：{error}"))?;
+    for row in rows {
+        run.outputs
+            .push(row.map_err(|error| format!("解析技能输出失败：{error}"))?);
+    }
+
+    Ok(run)
+}
+
+fn list_cached_skills(connection: &Connection) -> Result<Vec<ScienceSkill>, String> {
+    let mut statement = connection
+        .prepare(
+            "
+      SELECT id, name, description, domain, source, source_path, upstream_commit,
+             execution_mode, status, required_inputs_json, required_env_json, updated_at
+      FROM skills_cache
+      ORDER BY domain ASC, name ASC
+      ",
+        )
+        .map_err(|error| format!("读取技能缓存失败：{error}"))?;
+    let rows = statement
+        .query_map([], row_to_science_skill)
+        .map_err(|error| format!("读取技能缓存列表失败：{error}"))?;
+
+    let mut skills = Vec::new();
+    for row in rows {
+        skills.push(row.map_err(|error| format!("解析技能缓存失败：{error}"))?);
+    }
+    Ok(skills)
 }
 
 #[tauri::command]
@@ -1131,6 +1484,170 @@ fn ask_document(
 }
 
 #[tauri::command]
+fn list_skills(
+    app: AppHandle,
+    state: tauri::State<'_, ResearchProcessState>,
+) -> Result<Vec<ScienceSkill>, String> {
+    ensure_storage(&app)?;
+    let connection = open_connection(&app)?;
+    let port = match ensure_research_service(&app, &state) {
+        Ok(port) => port,
+        Err(error) => {
+            let cached = list_cached_skills(&connection)?;
+            if cached.is_empty() {
+                return Err(error);
+            }
+            return Ok(cached);
+        }
+    };
+
+    let response = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()
+        .map_err(|error| format!("无法创建技能服务客户端：{error}"))?
+        .get(service_url(port, "/skills"))
+        .send();
+
+    match response {
+        Ok(response) if response.status().is_success() => {
+            let service_response = response
+                .json::<ListSkillsResponse>()
+                .map_err(|error| format!("解析技能列表失败：{error}"))?;
+            for skill in &service_response.skills {
+                persist_skill_cache(&connection, skill)?;
+            }
+            Ok(service_response.skills)
+        }
+        Ok(response) => {
+            let error = extract_service_error(response);
+            let cached = list_cached_skills(&connection)?;
+            if cached.is_empty() {
+                Err(error)
+            } else {
+                Ok(cached)
+            }
+        }
+        Err(error) => {
+            let cached = list_cached_skills(&connection)?;
+            if cached.is_empty() {
+                Err(format!("调用技能服务失败：{error}"))
+            } else {
+                Ok(cached)
+            }
+        }
+    }
+}
+
+#[tauri::command]
+fn get_skill(
+    app: AppHandle,
+    state: tauri::State<'_, ResearchProcessState>,
+    id: String,
+) -> Result<ScienceSkill, String> {
+    ensure_storage(&app)?;
+    let connection = open_connection(&app)?;
+    let port = match ensure_research_service(&app, &state) {
+        Ok(port) => port,
+        Err(error) => {
+            return get_cached_skill(&connection, &id)?
+                .ok_or_else(|| format!("{error}，且本地没有该技能缓存。"));
+        }
+    };
+
+    let response = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()
+        .map_err(|error| format!("无法创建技能服务客户端：{error}"))?
+        .get(service_url(port, &format!("/skills/{id}")))
+        .send();
+
+    match response {
+        Ok(response) if response.status().is_success() => {
+            let skill = response
+                .json::<ScienceSkill>()
+                .map_err(|error| format!("解析技能详情失败：{error}"))?;
+            persist_skill_cache(&connection, &skill)?;
+            Ok(skill)
+        }
+        Ok(response) => {
+            let error = extract_service_error(response);
+            get_cached_skill(&connection, &id)?.ok_or(error)
+        }
+        Err(error) => {
+            get_cached_skill(&connection, &id)?.ok_or_else(|| format!("调用技能服务失败：{error}"))
+        }
+    }
+}
+
+#[tauri::command]
+fn run_skill(
+    app: AppHandle,
+    state: tauri::State<'_, ResearchProcessState>,
+    id: String,
+    inputs: serde_json::Value,
+    active_document_id: Option<String>,
+) -> Result<SkillRun, String> {
+    ensure_storage(&app)?;
+    if !inputs.is_object() {
+        return Err("技能输入必须是结构化对象。".to_string());
+    }
+
+    let connection = open_connection(&app)?;
+    let (active_document_id, active_document_path) = match active_document_id {
+        Some(document_id) if !document_id.trim().is_empty() => {
+            let document = get_document_from_connection(&connection, &document_id)?;
+            (Some(document.id), Some(document.stored_path))
+        }
+        _ => (None, None),
+    };
+
+    let context = SkillRunContext {
+        active_document_id,
+        active_document_path,
+        selected_text: None,
+        provider: None,
+    };
+    let payload = RunSkillPayload { inputs, context };
+    let inputs_json = serde_json::to_string(&payload.inputs)
+        .map_err(|error| format!("序列化技能输入失败：{error}"))?;
+    let context_json = serde_json::to_string(&payload.context)
+        .map_err(|error| format!("序列化技能上下文失败：{error}"))?;
+
+    let port = ensure_research_service(&app, &state)?;
+    let response = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()
+        .map_err(|error| format!("无法创建技能服务客户端：{error}"))?
+        .post(service_url(port, &format!("/skills/{id}/run")))
+        .json(&payload)
+        .send();
+
+    match response {
+        Ok(response) if response.status().is_success() => {
+            let service_response = response
+                .json::<RunSkillResponse>()
+                .map_err(|error| format!("解析技能运行响应失败：{error}"))?;
+            persist_skill_run(
+                &connection,
+                &service_response.run,
+                &inputs_json,
+                &context_json,
+            )?;
+            Ok(service_response.run)
+        }
+        Ok(response) => Err(extract_service_error(response)),
+        Err(error) => Err(format!("调用技能服务失败：{error}")),
+    }
+}
+
+#[tauri::command]
+fn get_skill_run(app: AppHandle, id: String) -> Result<SkillRun, String> {
+    ensure_storage(&app)?;
+    let connection = open_connection(&app)?;
+    get_skill_run_from_connection(&connection, &id)
+}
+
+#[tauri::command]
 fn delete_document(app: AppHandle, id: String) -> Result<bool, String> {
     ensure_storage(&app)?;
     let connection = open_connection(&app)?;
@@ -1182,6 +1699,10 @@ pub fn run() {
             update_reading_state,
             index_document,
             ask_document,
+            list_skills,
+            get_skill,
+            run_skill,
+            get_skill_run,
             delete_document
         ])
         .run(tauri::generate_context!())
