@@ -1,5 +1,7 @@
 import { invoke } from '@tauri-apps/api/core'
+import { appDataDir, join } from '@tauri-apps/api/path'
 import { open } from '@tauri-apps/plugin-dialog'
+import { Stronghold, type Store } from '@tauri-apps/plugin-stronghold'
 import {
   type CSSProperties,
   type PointerEvent as ReactPointerEvent,
@@ -61,9 +63,65 @@ type PdfBytes = {
   bytes: number[]
 }
 
+type ProviderSettings = {
+  provider: 'openai-compatible'
+  baseUrl: string
+  model: string
+  hasApiKey: boolean
+  updatedAt: string | null
+}
+
+type ProviderConnectionResult = {
+  ok: boolean
+  message: string
+  checkedAt: string
+}
+
+type ResearchRun = {
+  id: string
+  kind: string
+  status: string
+  documentId: string
+  startedAt: string
+  finishedAt: string | null
+  error: string | null
+  logs: Array<{
+    timestamp: string
+    level: string
+    message: string
+  }>
+}
+
+type QaCitation = {
+  id: string
+  documentId: string
+  title: string
+  page: number | null
+  excerpt: string
+  sourceLabel: string
+  confidence: number | null
+}
+
+type QaAnswer = {
+  id: string
+  documentId: string
+  question: string
+  answer: string
+  citations: QaCitation[]
+  createdAt: string
+}
+
+type AskDocumentResult = {
+  run: ResearchRun
+  answer: QaAnswer
+}
+
 const DEFAULT_PDF_PANE_WIDTH = 520
 const MIN_PDF_PANE_WIDTH = 420
 const MAX_PDF_PANE_WIDTH = 900
+const STRONGHOLD_PASSWORD = 'novum-phase3-local-vault'
+const STRONGHOLD_CLIENT = 'novum'
+const PROVIDER_API_KEY = 'openai-compatible-api-key'
 
 const skills = [
   {
@@ -106,6 +164,46 @@ function uniquePages(pages: number[], pageCount: number) {
 
 function cleanupPdfDocument(document: PDFDocumentProxy | null) {
   void document?.cleanup()
+}
+
+async function withCredentialStore<T>(
+  action: (store: Store) => Promise<T>,
+) {
+  const { stronghold, client } = await getCredentialClient()
+  try {
+    return await action(client.getStore())
+  } finally {
+    await stronghold.save()
+    await stronghold.unload()
+  }
+}
+
+async function getCredentialClient() {
+  const dataDir = await appDataDir()
+  const vaultPath = await join(dataDir, 'novum-credentials.stronghold')
+  const stronghold = await Stronghold.load(vaultPath, STRONGHOLD_PASSWORD)
+  try {
+    return { stronghold, client: await stronghold.loadClient(STRONGHOLD_CLIENT) }
+  } catch {
+    return { stronghold, client: await stronghold.createClient(STRONGHOLD_CLIENT) }
+  }
+}
+
+async function saveProviderApiKey(apiKey: string) {
+  const trimmed = apiKey.trim()
+  if (!trimmed) return
+
+  const encoded = Array.from(new TextEncoder().encode(trimmed))
+  await withCredentialStore(async (store) => {
+    await store.insert(PROVIDER_API_KEY, encoded)
+  })
+}
+
+async function readProviderApiKey() {
+  return withCredentialStore(async (store) => {
+    const value = await store.get(PROVIDER_API_KEY)
+    return value ? new TextDecoder().decode(value) : ''
+  })
 }
 
 type PdfPageCanvasProps = {
@@ -205,6 +303,20 @@ function App() {
   const [pdfStageWidth, setPdfStageWidth] = useState(DEFAULT_PDF_PANE_WIDTH)
   const [isCommandOpen, setIsCommandOpen] = useState(false)
   const [selectedCitationPage, setSelectedCitationPage] = useState(1)
+  const [providerSettings, setProviderSettings] = useState<ProviderSettings | null>(null)
+  const [providerForm, setProviderForm] = useState({
+    baseUrl: 'https://api.openai.com/v1',
+    model: 'gpt-4o-mini',
+    apiKey: '',
+  })
+  const [isSavingProvider, setIsSavingProvider] = useState(false)
+  const [isTestingProvider, setIsTestingProvider] = useState(false)
+  const [isIndexingDocument, setIsIndexingDocument] = useState(false)
+  const [isAskingDocument, setIsAskingDocument] = useState(false)
+  const [paperQuestion, setPaperQuestion] = useState('')
+  const [latestAnswer, setLatestAnswer] = useState<QaAnswer | null>(null)
+  const [activeCitationId, setActiveCitationId] = useState<string | null>(null)
+  const [latestRun, setLatestRun] = useState<ResearchRun | null>(null)
   const [message, setMessage] = useState('正在读取本地文献库。')
   const [error, setError] = useState<string | null>(null)
 
@@ -213,6 +325,7 @@ function App() {
     [documents, selectedDocumentId],
   )
   const selectedSkill = skills[selectedSkillIndex]
+  const isProviderReady = Boolean(providerSettings?.hasApiKey)
   const pdfPageCount = pdfDocument?.numPages ?? selectedDocument?.pageCount ?? 0
   const pdfPageNumbers = useMemo(
     () => Array.from({ length: pdfPageCount }, (_, index) => index + 1),
@@ -321,6 +434,25 @@ function App() {
   useEffect(() => {
     void Promise.resolve().then(() => loadDocuments())
   }, [loadDocuments])
+
+  useEffect(() => {
+    async function loadProviderSettings() {
+      try {
+        const settings = await invoke<ProviderSettings>('get_provider_settings')
+        setProviderSettings(settings)
+        setProviderForm((current) => ({
+          ...current,
+          baseUrl: settings.baseUrl,
+          model: settings.model,
+          apiKey: '',
+        }))
+      } catch (reason) {
+        setError(String(reason))
+      }
+    }
+
+    void loadProviderSettings()
+  }, [])
 
   useEffect(() => {
     if (isPdfCollapsed) return
@@ -438,6 +570,8 @@ function App() {
   function selectDocument(document: DocumentRecord) {
     selectDocumentState(document)
     setActivePanel('library')
+    setLatestAnswer(null)
+    setActiveCitationId(null)
     setMessage(`已打开文献「${document.title}」。`)
   }
 
@@ -501,13 +635,138 @@ function App() {
     await deleteDocument(selectedDocument)
   }
 
+  async function persistProviderSettings(showSuccess = true) {
+    const apiKey = providerForm.apiKey.trim()
+    if (apiKey) {
+      await saveProviderApiKey(apiKey)
+    }
+
+    const settings = await invoke<ProviderSettings>('save_provider_settings', {
+      settings: {
+        provider: 'openai-compatible',
+        baseUrl: providerForm.baseUrl,
+        model: providerForm.model,
+        hasApiKey: Boolean(apiKey || providerSettings?.hasApiKey),
+      },
+    })
+    setProviderSettings(settings)
+    setProviderForm((current) => ({ ...current, apiKey: '' }))
+    if (showSuccess) {
+      setMessage('模型配置已保存。')
+    }
+    return settings
+  }
+
+  async function saveProviderSettings() {
+    setIsSavingProvider(true)
+    setError(null)
+    try {
+      await persistProviderSettings()
+    } catch (reason) {
+      setError(String(reason))
+      setMessage('保存模型配置失败。')
+    } finally {
+      setIsSavingProvider(false)
+    }
+  }
+
+  async function testProviderConnection() {
+    setIsTestingProvider(true)
+    setError(null)
+    try {
+      await persistProviderSettings(false)
+      const apiKey = providerForm.apiKey.trim() || await readProviderApiKey()
+      const result = await invoke<ProviderConnectionResult>('test_provider_connection', {
+        apiKey,
+      })
+      setMessage(result.message)
+      if (!result.ok) {
+        setError(result.message)
+      }
+    } catch (reason) {
+      setError(String(reason))
+      setMessage('模型服务连接测试失败。')
+    } finally {
+      setIsTestingProvider(false)
+    }
+  }
+
+  async function indexSelectedDocument() {
+    if (!selectedDocument) {
+      setMessage('请先导入并选择一篇 PDF 文献。')
+      return
+    }
+
+    setIsIndexingDocument(true)
+    setError(null)
+    setActivePanel('qa')
+    try {
+      const apiKey = await readProviderApiKey()
+      const run = await invoke<ResearchRun>('index_document', {
+        id: selectedDocument.id,
+        apiKey,
+      })
+      setLatestRun(run)
+      await loadDocuments(selectedDocument.id)
+      setMessage('PaperQA 索引已完成，可以开始提问。')
+    } catch (reason) {
+      setError(String(reason))
+      setMessage('PaperQA 索引失败。')
+      await loadDocuments(selectedDocument.id)
+    } finally {
+      setIsIndexingDocument(false)
+    }
+  }
+
+  async function askSelectedDocument() {
+    if (!selectedDocument) {
+      setMessage('请先导入并选择一篇 PDF 文献。')
+      return
+    }
+
+    setIsAskingDocument(true)
+    setError(null)
+    setActivePanel('qa')
+    try {
+      const apiKey = await readProviderApiKey()
+      const result = await invoke<AskDocumentResult>('ask_document', {
+        id: selectedDocument.id,
+        question: paperQuestion,
+        apiKey,
+      })
+      setLatestRun(result.run)
+      setLatestAnswer(result.answer)
+      setActiveCitationId(result.answer.citations[0]?.id ?? null)
+      setMessage('PaperQA 已返回真实问答结果。')
+    } catch (reason) {
+      setError(String(reason))
+      setMessage('PaperQA 问答失败。')
+    } finally {
+      setIsAskingDocument(false)
+    }
+  }
+
+  function followCitation(citation: QaCitation) {
+    setActiveCitationId(citation.id)
+    if (!citation.page) {
+      setMessage('这条引用暂未返回可跳转页码。')
+      return
+    }
+    jumpToPage(citation.page)
+    setMessage(`已跳转到引用来源第 ${citation.page} 页。`)
+  }
+
   function runPaperQa() {
     setActivePanel('qa')
     if (!selectedDocument) {
       setMessage('请先导入并选择一篇 PDF 文献。')
       return
     }
-    setMessage('论文问答引擎尚未接入。本阶段只完成文献库、PDF 预览和阅读状态。')
+    if (selectedDocument.status === '已索引') {
+      setMessage('请输入问题并发起 PaperQA 问答。')
+      return
+    }
+    setMessage('请先为当前文献建立 PaperQA 索引。')
   }
 
   function selectSkill(index: number) {
@@ -763,8 +1022,8 @@ function App() {
           </div>
           <div className="status-strip" aria-label="本地运行状态">
             <span>{documents.length ? `本地文献 ${documents.length} 篇` : '文献库为空'}</span>
-            <span>模型尚未配置</span>
-            <span>论文问答适配器待接入</span>
+            <span>{isProviderReady ? '模型已配置' : '模型尚未配置'}</span>
+            <span>PaperQA 本地服务</span>
           </div>
         </header>
 
@@ -776,9 +1035,23 @@ function App() {
                 ? `当前文献：${selectedDocument.title}`
                 : '请先导入 PDF，再围绕文献发起问题。'}
             </span>
-            <button type="button" onClick={runPaperQa}>
-              <Sparkles size={16} aria-hidden="true" />
-              发起论文问答
+            <button
+              type="button"
+              onClick={() => {
+                if (selectedDocument?.status === '已索引') {
+                  void askSelectedDocument()
+                  return
+                }
+                void indexSelectedDocument()
+              }}
+              disabled={!selectedDocument || isIndexingDocument || isAskingDocument}
+            >
+              {isIndexingDocument || isAskingDocument ? (
+                <Loader2 className="spin" size={16} aria-hidden="true" />
+              ) : (
+                <Sparkles size={16} aria-hidden="true" />
+              )}
+              {selectedDocument?.status === '已索引' ? '发起论文问答' : '索引当前文献'}
             </button>
           </div>
         </section>
@@ -792,6 +1065,9 @@ function App() {
               </button>
               <button type="button" onClick={runPaperQa}>
                 对当前文献提问
+              </button>
+              <button type="button" onClick={() => void indexSelectedDocument()}>
+                索引当前文献
               </button>
               <button type="button" onClick={() => selectPanel('skills')}>
                 打开技能市场
@@ -822,8 +1098,8 @@ function App() {
                 {zoom}%
               </p>
               <p>
-                PaperQA 与科学技能执行尚未接入。本阶段保留真实文献、PDF 预览和阅读状态，
-                后续会基于当前文献 ID 调用研究适配器。
+                索引状态：{selectedDocument.status}。Phase 3 会基于当前文献 ID 调用本地
+                PaperQA 研究服务。
               </p>
             </div>
           ) : (
@@ -837,6 +1113,113 @@ function App() {
           <div className="message-line" aria-live="polite">
             {error ?? message}
           </div>
+
+          {activePanel === 'settings' ? (
+            <section className="settings-panel" aria-label="模型配置">
+              <div className="section-heading">
+                <span>OpenAI-compatible Provider</span>
+                <span>{providerSettings?.hasApiKey ? '已保存密钥' : '未保存密钥'}</span>
+              </div>
+              <label className="form-field">
+                <span>Base URL</span>
+                <input
+                  value={providerForm.baseUrl}
+                  placeholder="https://api.openai.com/v1"
+                  onChange={(event) =>
+                    setProviderForm((current) => ({ ...current, baseUrl: event.target.value }))
+                  }
+                />
+              </label>
+              <label className="form-field">
+                <span>模型</span>
+                <input
+                  value={providerForm.model}
+                  placeholder="gpt-4o-mini"
+                  onChange={(event) =>
+                    setProviderForm((current) => ({ ...current, model: event.target.value }))
+                  }
+                />
+              </label>
+              <label className="form-field">
+                <span>API Key</span>
+                <input
+                  type="password"
+                  value={providerForm.apiKey}
+                  placeholder={providerSettings?.hasApiKey ? '已保存，留空则继续使用原密钥' : '输入 API Key'}
+                  onChange={(event) =>
+                    setProviderForm((current) => ({ ...current, apiKey: event.target.value }))
+                  }
+                />
+              </label>
+              <div className="form-actions">
+                <button type="button" onClick={() => void saveProviderSettings()} disabled={isSavingProvider}>
+                  {isSavingProvider ? <Loader2 className="spin" size={15} aria-hidden="true" /> : <Settings size={15} aria-hidden="true" />}
+                  保存配置
+                </button>
+                <button type="button" onClick={() => void testProviderConnection()} disabled={isTestingProvider}>
+                  {isTestingProvider ? <Loader2 className="spin" size={15} aria-hidden="true" /> : <Sparkles size={15} aria-hidden="true" />}
+                  测试连接
+                </button>
+              </div>
+            </section>
+          ) : null}
+
+          {selectedDocument ? (
+            <section className="paperqa-panel" aria-label="PaperQA 问答">
+              <div className="section-heading">
+                <span>PaperQA</span>
+                <span>{latestRun ? `${latestRun.kind} | ${latestRun.status}` : '等待任务'}</span>
+              </div>
+              <textarea
+                value={paperQuestion}
+                placeholder="围绕当前文献提出一个可被来源支撑的问题"
+                onChange={(event) => setPaperQuestion(event.target.value)}
+              />
+              <div className="form-actions">
+                <button
+                  type="button"
+                  onClick={() => void indexSelectedDocument()}
+                  disabled={isIndexingDocument || !isProviderReady}
+                >
+                  {isIndexingDocument ? <Loader2 className="spin" size={15} aria-hidden="true" /> : <FileSearch size={15} aria-hidden="true" />}
+                  {selectedDocument.status === '索引失败' ? '重试索引' : '索引当前文献'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void askSelectedDocument()}
+                  disabled={isAskingDocument || selectedDocument.status !== '已索引' || !paperQuestion.trim()}
+                >
+                  {isAskingDocument ? <Loader2 className="spin" size={15} aria-hidden="true" /> : <Sparkles size={15} aria-hidden="true" />}
+                  发起问答
+                </button>
+              </div>
+            </section>
+          ) : null}
+
+          {latestAnswer ? (
+            <section className="qa-answer-card" aria-label="PaperQA 回答">
+              <p className="eyebrow">真实 PaperQA 回答</p>
+              <h3>{latestAnswer.question}</h3>
+              <p>{latestAnswer.answer}</p>
+              <div className="citation-list">
+                {latestAnswer.citations.length ? (
+                  latestAnswer.citations.map((citation) => (
+                    <button
+                      className={citation.id === activeCitationId ? 'selected' : ''}
+                      type="button"
+                      key={citation.id}
+                      onClick={() => followCitation(citation)}
+                    >
+                      <strong>{citation.page ? `第 ${citation.page} 页` : '页码未知'}</strong>
+                      <span>{citation.excerpt}</span>
+                    </button>
+                  ))
+                ) : (
+                  <div className="empty-state compact">PaperQA 未返回结构化引用。</div>
+                )}
+              </div>
+            </section>
+          ) : null}
 
           {selectedDocument ? (
             <div className="source-row" aria-label="页码快捷跳转">

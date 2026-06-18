@@ -88,6 +88,15 @@ xcode-select --install
 npm --prefix apps/desktop install
 ```
 
+Phase 3 PaperQA 本地研究服务需要单独准备 Python 环境：
+
+```sh
+cd services/research
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e ".[test]"
+```
+
 ## 本地运行
 
 除特别说明外，以下命令均从仓库根目录执行。

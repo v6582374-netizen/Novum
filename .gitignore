@@ -7,6 +7,10 @@ node_modules/
 dist/
 dist-ssr/
 coverage/
+__pycache__/
+*.py[cod]
+.venv/
+services/research/.venv/
 
 target/
 **/target/

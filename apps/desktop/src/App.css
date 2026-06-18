@@ -345,7 +345,7 @@ kbd {
 
 .command-list {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(138px, 1fr));
   gap: 8px;
 }
 
@@ -427,6 +427,103 @@ kbd {
 
 .document-detail strong {
   color: var(--text-strong);
+}
+
+.settings-panel,
+.paperqa-panel,
+.qa-answer-card {
+  display: grid;
+  gap: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 14px;
+  background: rgba(26, 32, 41, 0.74);
+}
+
+.form-field {
+  display: grid;
+  gap: 6px;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.form-field input,
+.paperqa-panel textarea {
+  width: 100%;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  outline: 0;
+  padding: 9px 10px;
+  color: var(--text-strong);
+  background: var(--surface);
+  font: inherit;
+}
+
+.form-field input:focus,
+.paperqa-panel textarea:focus {
+  border-color: var(--accent-border);
+}
+
+.paperqa-panel textarea {
+  min-height: 92px;
+  resize: vertical;
+}
+
+.form-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.form-actions button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+  border: 1px solid var(--accent-border);
+  border-radius: 7px;
+  padding: 0 10px;
+  color: var(--text-strong);
+  background: var(--accent-soft);
+  font-weight: 700;
+}
+
+.qa-answer-card h3 {
+  font-size: 14px;
+}
+
+.citation-list {
+  display: grid;
+  gap: 8px;
+}
+
+.citation-list button {
+  display: grid;
+  gap: 5px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 10px;
+  color: var(--text);
+  background: var(--surface);
+  text-align: left;
+}
+
+.citation-list button.selected,
+.citation-list button:hover {
+  border-color: var(--accent-border);
+  background: var(--accent-soft);
+}
+
+.citation-list strong {
+  color: var(--text-strong);
+  font-size: 12px;
+}
+
+.citation-list span {
+  color: var(--text);
+  font-size: 12px;
 }
 
 .empty-state {
