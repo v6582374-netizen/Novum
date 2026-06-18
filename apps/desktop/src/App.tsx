@@ -210,12 +210,9 @@ async function withCredentialStore<T>(
   action: (store: Store) => Promise<T>,
 ) {
   const { stronghold, client } = await getCredentialClient()
-  try {
-    return await action(client.getStore())
-  } finally {
-    await stronghold.save()
-    await stronghold.unload()
-  }
+  const result = await action(client.getStore())
+  await stronghold.save()
+  return result
 }
 
 async function getCredentialClient() {
@@ -368,6 +365,8 @@ function App() {
   })
   const [isSavingProvider, setIsSavingProvider] = useState(false)
   const [isTestingProvider, setIsTestingProvider] = useState(false)
+  const [isImportingProviderKey, setIsImportingProviderKey] = useState(false)
+  const [providerOperationMessage, setProviderOperationMessage] = useState('')
   const [isIndexingDocument, setIsIndexingDocument] = useState(false)
   const [isAskingDocument, setIsAskingDocument] = useState(false)
   const [paperQuestion, setPaperQuestion] = useState('')
@@ -750,9 +749,11 @@ function App() {
   async function persistProviderSettings(showSuccess = true) {
     const apiKey = providerForm.apiKey.trim()
     if (apiKey) {
+      setProviderOperationMessage('正在把 API Key 写入本地 Stronghold。')
       await saveProviderApiKey(providerForm.provider, apiKey)
     }
 
+    setProviderOperationMessage('正在保存模型服务配置到本地数据库。')
     const settings = await invoke<ProviderSettings>('save_provider_settings', {
       settings: {
         provider: providerForm.provider,
@@ -764,6 +765,7 @@ function App() {
     setProviderSettings(settings)
     setProviderForm((current) => ({ ...current, apiKey: '' }))
     if (showSuccess) {
+      setProviderOperationMessage('模型配置已保存。')
       setMessage('模型配置已保存。')
     }
     return settings
@@ -772,10 +774,12 @@ function App() {
   async function saveProviderSettings() {
     setIsSavingProvider(true)
     setError(null)
+    setProviderOperationMessage('正在准备保存模型配置。')
     try {
       await persistProviderSettings()
     } catch (reason) {
       setError(String(reason))
+      setProviderOperationMessage('保存模型配置失败。')
       setMessage('保存模型配置失败。')
     } finally {
       setIsSavingProvider(false)
@@ -794,16 +798,21 @@ function App() {
   }
 
   async function importDevelopmentApiKey() {
+    setIsImportingProviderKey(true)
     setError(null)
+    setProviderOperationMessage('正在查找内置/本机测试密钥。')
     try {
       const apiKey = await invoke<string | null>('load_development_api_key', {
         provider: providerForm.provider,
       })
       if (!apiKey) {
+        setProviderOperationMessage('未找到本机测试密钥。')
         setMessage('未找到本机测试密钥。请使用环境变量或 secrets/ 本地文件。')
         return
       }
+      setProviderOperationMessage('已找到测试密钥，正在写入本地 Stronghold。')
       await saveProviderApiKey(providerForm.provider, apiKey)
+      setProviderOperationMessage('正在保存当前 provider 配置。')
       const settings = await invoke<ProviderSettings>('save_provider_settings', {
         settings: {
           provider: providerForm.provider,
@@ -816,28 +825,38 @@ function App() {
       setProviderForm((current) => ({ ...current, apiKey: '' }))
       const presets = await invoke<ProviderPreset[]>('get_provider_presets')
       setProviderPresets(presets)
+      setProviderOperationMessage('测试密钥已导入并保存。')
       setMessage('已从本机安全位置导入测试密钥。')
     } catch (reason) {
       setError(String(reason))
+      setProviderOperationMessage('导入本机测试密钥失败。')
       setMessage('导入本机测试密钥失败。')
+    } finally {
+      setIsImportingProviderKey(false)
     }
   }
 
   async function testProviderConnection() {
     setIsTestingProvider(true)
     setError(null)
+    setProviderOperationMessage('正在保存配置并准备发起模型连接测试。')
     try {
       await persistProviderSettings(false)
       const apiKey = providerForm.apiKey.trim() || await readProviderApiKey(providerForm.provider)
+      setProviderOperationMessage(
+        `正在请求 ${providerForm.baseUrl.replace(/\/$/, '')}/chat/completions，最多等待 20 秒。`,
+      )
       const result = await invoke<ProviderConnectionResult>('test_provider_connection', {
         apiKey,
       })
+      setProviderOperationMessage(result.message)
       setMessage(result.message)
       if (!result.ok) {
         setError(result.message)
       }
     } catch (reason) {
       setError(String(reason))
+      setProviderOperationMessage('模型服务连接测试失败。')
       setMessage('模型服务连接测试失败。')
     } finally {
       setIsTestingProvider(false)
@@ -1513,6 +1532,11 @@ function App() {
                   }
                 />
               </label>
+              {providerOperationMessage ? (
+                <div className="provider-operation-status" aria-live="polite">
+                  {providerOperationMessage}
+                </div>
+              ) : null}
               <div className="form-actions">
                 <button type="button" onClick={() => void saveProviderSettings()} disabled={isSavingProvider}>
                   {isSavingProvider ? <Loader2 className="spin" size={15} aria-hidden="true" /> : <Settings size={15} aria-hidden="true" />}
@@ -1522,8 +1546,16 @@ function App() {
                   {isTestingProvider ? <Loader2 className="spin" size={15} aria-hidden="true" /> : <Sparkles size={15} aria-hidden="true" />}
                   测试连接
                 </button>
-                <button type="button" onClick={() => void importDevelopmentApiKey()}>
-                  <Sparkles size={15} aria-hidden="true" />
+                <button
+                  type="button"
+                  onClick={() => void importDevelopmentApiKey()}
+                  disabled={isImportingProviderKey}
+                >
+                  {isImportingProviderKey ? (
+                    <Loader2 className="spin" size={15} aria-hidden="true" />
+                  ) : (
+                    <Sparkles size={15} aria-hidden="true" />
+                  )}
                   导入本机测试密钥
                 </button>
               </div>

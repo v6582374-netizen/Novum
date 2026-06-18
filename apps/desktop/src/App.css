@@ -546,6 +546,16 @@ kbd {
   line-height: 1.45;
 }
 
+.provider-operation-status {
+  border: 1px solid rgba(61, 189, 199, 0.34);
+  border-radius: 7px;
+  padding: 9px 10px;
+  color: var(--text-strong);
+  background: rgba(61, 189, 199, 0.08);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
 .skill-output {
   display: grid;
   gap: 8px;
