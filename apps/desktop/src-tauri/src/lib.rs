@@ -11,7 +11,7 @@ use std::{
     process::{Child, Command, Stdio},
     sync::Mutex,
     thread,
-    time::Duration,
+    time::{Duration, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Manager};
 use uuid::Uuid;
@@ -210,11 +210,6 @@ pub struct ScienceSkill {
     updated_at: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct ListSkillsResponse {
-    skills: Vec<ScienceSkill>,
-}
-
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct SkillRunLog {
@@ -261,11 +256,6 @@ struct SkillRunContext {
 struct RunSkillPayload {
     inputs: serde_json::Value,
     context: SkillRunContext,
-}
-
-#[derive(Debug, Deserialize)]
-struct RunSkillResponse {
-    run: SkillRun,
 }
 
 fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
@@ -598,7 +588,7 @@ fn provider_presets() -> Result<Vec<ProviderPreset>, String> {
                 .to_string(),
             base_url: "https://api.openai.com/v1".to_string(),
             model: "gpt-4o-mini".to_string(),
-            has_development_key: read_development_api_key("openai-compatible")?.is_some(),
+            has_development_key: false,
         },
         ProviderPreset {
             provider: "deepseek".to_string(),
@@ -607,7 +597,7 @@ fn provider_presets() -> Result<Vec<ProviderPreset>, String> {
                 .to_string(),
             base_url: "https://api.deepseek.com".to_string(),
             model: "deepseek-v4-flash".to_string(),
-            has_development_key: read_development_api_key("deepseek")?.is_some(),
+            has_development_key: false,
         },
         ProviderPreset {
             provider: "test-relay".to_string(),
@@ -1095,6 +1085,378 @@ fn get_skill_run_from_connection(connection: &Connection, id: &str) -> Result<Sk
     Ok(run)
 }
 
+fn science_skills_dir() -> Result<PathBuf, String> {
+    Ok(repo_root_dir()?.join("vendor").join("science-skills"))
+}
+
+fn science_skills_skills_dir() -> Result<PathBuf, String> {
+    Ok(science_skills_dir()?.join("skills"))
+}
+
+fn normalize_skill_id(value: &str) -> Option<String> {
+    let normalized = value
+        .trim()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '_' || character == '-' {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    (!normalized.is_empty()).then_some(normalized)
+}
+
+fn compact_text(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn parse_frontmatter(text: &str) -> (std::collections::HashMap<String, String>, String) {
+    let mut metadata = std::collections::HashMap::new();
+    if !text.starts_with("---") {
+        return (metadata, text.to_string());
+    }
+
+    let lines = text.lines().collect::<Vec<_>>();
+    let Some(closing_index) = lines
+        .iter()
+        .enumerate()
+        .skip(1)
+        .find_map(|(index, line)| (line.trim() == "---").then_some(index))
+    else {
+        return (metadata, text.to_string());
+    };
+
+    let mut current_key: Option<String> = None;
+    let mut current_lines = Vec::new();
+    let mut flush = |key: &mut Option<String>, lines: &mut Vec<String>| {
+        if let Some(key) = key.take() {
+            metadata.insert(key, compact_text(&lines.join(" ")));
+            lines.clear();
+        }
+    };
+
+    for line in &lines[1..closing_index] {
+        let starts_with_whitespace = line
+            .chars()
+            .next()
+            .map(char::is_whitespace)
+            .unwrap_or(false);
+        if !starts_with_whitespace && line.contains(':') {
+            flush(&mut current_key, &mut current_lines);
+            let mut parts = line.splitn(2, ':');
+            let key = parts.next().unwrap_or_default().trim().to_string();
+            let raw_value = parts.next().unwrap_or_default().trim();
+            current_key = Some(key);
+            if !matches!(raw_value, ">" | ">-" | "|" | "|-") {
+                current_lines.push(raw_value.trim_matches('"').trim_matches('\'').to_string());
+            }
+        } else if current_key.is_some() {
+            current_lines.push(line.trim().to_string());
+        }
+    }
+    flush(&mut current_key, &mut current_lines);
+
+    (metadata, lines[closing_index + 1..].join("\n"))
+}
+
+fn first_markdown_heading(markdown: &str) -> Option<String> {
+    markdown
+        .lines()
+        .find_map(|line| line.strip_prefix("# ").map(str::trim).map(str::to_string))
+        .filter(|value| !value.is_empty())
+}
+
+fn first_markdown_paragraph(markdown: &str) -> Option<String> {
+    let mut lines = Vec::new();
+    for line in markdown.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("---") {
+            if !lines.is_empty() {
+                break;
+            }
+            continue;
+        }
+        if trimmed.starts_with("```")
+            || trimmed.starts_with("- ")
+            || trimmed.starts_with("* ")
+            || trimmed.starts_with("1.")
+        {
+            if !lines.is_empty() {
+                break;
+            }
+            continue;
+        }
+        lines.push(trimmed);
+    }
+    (!lines.is_empty()).then(|| compact_text(&lines.join(" ")))
+}
+
+fn extract_required_env(text: &str) -> Vec<String> {
+    let mut values = text
+        .split(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+        .filter(|token| {
+            token.len() > 6
+                && token.chars().all(|character| {
+                    character.is_ascii_uppercase() || character.is_ascii_digit() || character == '_'
+                })
+                && (token.ends_with("API_KEY")
+                    || token.ends_with("ACCESS_TOKEN")
+                    || token.ends_with("TOKEN")
+                    || token.ends_with("SECRET"))
+                && !matches!(*token, "API_KEY" | "ACCESS_TOKEN" | "TOKEN" | "SECRET")
+        })
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    values.sort();
+    values.dedup();
+    values
+}
+
+fn mentions_uv(text: &str) -> bool {
+    text.split(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+        .any(|token| token.eq_ignore_ascii_case("uv"))
+}
+
+fn executable_in_path(name: &str) -> bool {
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|path| path.join(name).is_file()))
+        .unwrap_or(false)
+}
+
+fn infer_skill_domain(skill_id: &str, text: &str) -> String {
+    let probe = format!(
+        "{} {}",
+        skill_id,
+        text.chars().take(1200).collect::<String>()
+    )
+    .to_lowercase();
+    if ["literature", "pubmed", "arxiv", "biorxiv", "openalex"]
+        .iter()
+        .any(|term| probe.contains(term))
+    {
+        return "文献检索".to_string();
+    }
+    if ["protein", "uniprot", "pdb", "alphafold", "foldseek"]
+        .iter()
+        .any(|term| probe.contains(term))
+    {
+        return "蛋白质".to_string();
+    }
+    if [
+        "variant",
+        "genome",
+        "genomic",
+        "gnomad",
+        "clinvar",
+        "dbsnp",
+        "alphagenome",
+        "encode",
+        "gtex",
+        "jaspar",
+        "ucsc",
+        "unibind",
+        "ensembl",
+    ]
+    .iter()
+    .any(|term| probe.contains(term))
+    {
+        return "基因组学".to_string();
+    }
+    if ["chembl", "pubchem", "chemistry", "compound"]
+        .iter()
+        .any(|term| probe.contains(term))
+    {
+        return "化学".to_string();
+    }
+    if ["clinical", "openfda", "trial", "disease"]
+        .iter()
+        .any(|term| probe.contains(term))
+    {
+        return "临床医学".to_string();
+    }
+    if ["ontology", "go ", "reactome", "interpro", "string"]
+        .iter()
+        .any(|term| probe.contains(term))
+    {
+        return "生物知识库".to_string();
+    }
+    if ["uv", "workflow", "scienceskillscommon"]
+        .iter()
+        .any(|term| probe.contains(term))
+    {
+        return "基础工具".to_string();
+    }
+    "科学技能".to_string()
+}
+
+fn skill_status(skill_id: &str, text: &str, required_env: &[String]) -> String {
+    if skill_id == "uv" {
+        return "可用".to_string();
+    }
+    if mentions_uv(text) && !executable_in_path("uv") {
+        return "缺少依赖".to_string();
+    }
+    if required_env.iter().any(|name| {
+        std::env::var(name)
+            .map(|value| value.trim().is_empty())
+            .unwrap_or(true)
+    }) {
+        return "需要配置".to_string();
+    }
+    "可用".to_string()
+}
+
+fn skill_updated_at(path: &Path) -> String {
+    path.metadata()
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .and_then(|duration| chrono::DateTime::from_timestamp(duration.as_secs() as i64, 0))
+        .map(|timestamp| timestamp.to_rfc3339())
+        .unwrap_or_else(now_string)
+}
+
+fn parse_science_skill(path: &Path) -> Result<ScienceSkill, String> {
+    let text = fs::read_to_string(path).map_err(|error| format!("读取技能文件失败：{error}"))?;
+    let skill_id = path
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| "无法解析技能 ID。".to_string())?
+        .to_string();
+    let (metadata, body) = parse_frontmatter(&text);
+    let heading =
+        first_markdown_heading(&body).unwrap_or_else(|| skill_id.replace(['_', '-'], " "));
+    let name = metadata.get("name").cloned().unwrap_or(heading.clone());
+    let description = metadata
+        .get("description")
+        .cloned()
+        .or_else(|| first_markdown_paragraph(&body))
+        .unwrap_or(heading);
+    let required_env = extract_required_env(&text);
+    let has_scripts = path
+        .parent()
+        .map(|parent| parent.join("scripts").is_dir())
+        .unwrap_or(false);
+    let execution_mode = if has_scripts && !required_env.is_empty() {
+        "hybrid"
+    } else if has_scripts {
+        "python"
+    } else {
+        "prompt"
+    }
+    .to_string();
+    let source_path = path
+        .strip_prefix(repo_root_dir()?)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .to_string();
+
+    Ok(ScienceSkill {
+        id: skill_id.clone(),
+        name,
+        description: compact_text(&description),
+        domain: infer_skill_domain(&skill_id, &text),
+        source: "science-skills".to_string(),
+        source_path,
+        upstream_commit: "33557e0f1faf0f281d255940de58935c61b2143b".to_string(),
+        required_inputs: vec![SkillInputSpec {
+            name: "task".to_string(),
+            label: "任务上下文".to_string(),
+            input_type: "textarea".to_string(),
+            required: true,
+            default_value: None,
+            help: Some("描述你希望该技能处理的问题、对象或当前研究任务。".to_string()),
+        }],
+        required_env: required_env.clone(),
+        execution_mode,
+        status: skill_status(&skill_id, &text, &required_env),
+        updated_at: skill_updated_at(path),
+    })
+}
+
+fn list_science_skills_from_vendor() -> Result<Vec<ScienceSkill>, String> {
+    let root = science_skills_skills_dir()?;
+    if !root.is_dir() {
+        return Err("找不到 vendor/science-skills/skills，请确认上游快照已导入。".to_string());
+    }
+
+    let mut skills = Vec::new();
+    for entry in fs::read_dir(root).map_err(|error| format!("读取技能目录失败：{error}"))?
+    {
+        let entry = entry.map_err(|error| format!("读取技能目录项失败：{error}"))?;
+        let path = entry.path().join("SKILL.md");
+        if path.is_file() {
+            skills.push(parse_science_skill(&path)?);
+        }
+    }
+    skills.sort_by(|left, right| {
+        left.domain
+            .cmp(&right.domain)
+            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+    });
+    Ok(skills)
+}
+
+fn get_science_skill_from_vendor(id: &str) -> Result<ScienceSkill, String> {
+    let skill_id = normalize_skill_id(id).ok_or_else(|| "技能 ID 不能为空。".to_string())?;
+    let path = science_skills_skills_dir()?.join(skill_id).join("SKILL.md");
+    if !path.is_file() {
+        return Err("找不到这个科学技能。".to_string());
+    }
+    parse_science_skill(&path)
+}
+
+fn make_skill_log(level: &str, message: &str) -> SkillRunLog {
+    SkillRunLog {
+        timestamp: now_string(),
+        level: level.to_string(),
+        message: message.to_string(),
+    }
+}
+
+fn build_skill_dry_run_output(
+    skill: &ScienceSkill,
+    inputs: &serde_json::Value,
+    active_document_id: Option<&str>,
+    active_document_path: Option<&str>,
+) -> String {
+    let task = inputs
+        .get("task")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    [
+        format!("# {}", skill.name),
+        String::new(),
+        "## dry-run 结果".to_string(),
+        String::new(),
+        "Novum 已完成技能选择、上下文绑定和依赖检查。当前阶段不会直接执行上游脚本；真实执行会在后续受控 runner 中接入。".to_string(),
+        String::new(),
+        "## 技能信息".to_string(),
+        String::new(),
+        format!("- 技能 ID：`{}`", skill.id),
+        format!("- 领域：{}", skill.domain),
+        format!("- 来源：{}", skill.source_path),
+        format!("- 执行模式：{}", skill.execution_mode),
+        format!("- 状态：{}", skill.status),
+        String::new(),
+        "## 当前上下文".to_string(),
+        String::new(),
+        format!("- 当前文献 ID：{}", active_document_id.unwrap_or("未绑定当前文献")),
+        format!("- 当前文献路径：{}", active_document_path.unwrap_or("无")),
+        String::new(),
+        "## 用户任务".to_string(),
+        String::new(),
+        task.to_string(),
+    ]
+    .join("\n")
+}
+
 fn list_cached_skills(connection: &Connection) -> Result<Vec<ScienceSkill>, String> {
     let mut statement = connection
         .prepare(
@@ -1265,10 +1627,11 @@ fn get_provider_presets() -> Result<Vec<ProviderPreset>, String> {
 
 #[tauri::command]
 fn load_development_api_key(provider: String) -> Result<Option<String>, String> {
-    if provider_defaults(provider.trim()).is_none() {
-        return Err("未知模型服务类型。".to_string());
+    let provider = provider.trim();
+    if provider != "test-relay" {
+        return Err("本机测试密钥仅用于测试中转站。".to_string());
     }
-    read_development_api_key(provider.trim())
+    read_development_api_key(provider)
 }
 
 #[tauri::command]
@@ -1613,42 +1976,18 @@ fn ask_document(
 }
 
 #[tauri::command]
-fn list_skills(
-    app: AppHandle,
-    state: tauri::State<'_, ResearchProcessState>,
-) -> Result<Vec<ScienceSkill>, String> {
+fn list_skills(app: AppHandle) -> Result<Vec<ScienceSkill>, String> {
     ensure_storage(&app)?;
     let connection = open_connection(&app)?;
-    let port = match ensure_research_service(&app, &state) {
-        Ok(port) => port,
-        Err(error) => {
-            let cached = list_cached_skills(&connection)?;
-            if cached.is_empty() {
-                return Err(error);
-            }
-            return Ok(cached);
-        }
-    };
 
-    let response = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(60))
-        .build()
-        .map_err(|error| format!("无法创建技能服务客户端：{error}"))?
-        .get(service_url(port, "/skills"))
-        .send();
-
-    match response {
-        Ok(response) if response.status().is_success() => {
-            let service_response = response
-                .json::<ListSkillsResponse>()
-                .map_err(|error| format!("解析技能列表失败：{error}"))?;
-            for skill in &service_response.skills {
+    match list_science_skills_from_vendor() {
+        Ok(skills) => {
+            for skill in &skills {
                 persist_skill_cache(&connection, skill)?;
             }
-            Ok(service_response.skills)
+            Ok(skills)
         }
-        Ok(response) => {
-            let error = extract_service_error(response);
+        Err(error) => {
             let cached = list_cached_skills(&connection)?;
             if cached.is_empty() {
                 Err(error)
@@ -1656,62 +1995,26 @@ fn list_skills(
                 Ok(cached)
             }
         }
-        Err(error) => {
-            let cached = list_cached_skills(&connection)?;
-            if cached.is_empty() {
-                Err(format!("调用技能服务失败：{error}"))
-            } else {
-                Ok(cached)
-            }
-        }
     }
 }
 
 #[tauri::command]
-fn get_skill(
-    app: AppHandle,
-    state: tauri::State<'_, ResearchProcessState>,
-    id: String,
-) -> Result<ScienceSkill, String> {
+fn get_skill(app: AppHandle, id: String) -> Result<ScienceSkill, String> {
     ensure_storage(&app)?;
     let connection = open_connection(&app)?;
-    let port = match ensure_research_service(&app, &state) {
-        Ok(port) => port,
-        Err(error) => {
-            return get_cached_skill(&connection, &id)?
-                .ok_or_else(|| format!("{error}，且本地没有该技能缓存。"));
-        }
-    };
 
-    let response = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(60))
-        .build()
-        .map_err(|error| format!("无法创建技能服务客户端：{error}"))?
-        .get(service_url(port, &format!("/skills/{id}")))
-        .send();
-
-    match response {
-        Ok(response) if response.status().is_success() => {
-            let skill = response
-                .json::<ScienceSkill>()
-                .map_err(|error| format!("解析技能详情失败：{error}"))?;
+    match get_science_skill_from_vendor(&id) {
+        Ok(skill) => {
             persist_skill_cache(&connection, &skill)?;
             Ok(skill)
         }
-        Ok(response) => {
-            let error = extract_service_error(response);
-            get_cached_skill(&connection, &id)?.ok_or(error)
-        }
-        Err(error) => {
-            get_cached_skill(&connection, &id)?.ok_or_else(|| format!("调用技能服务失败：{error}"))
-        }
+        Err(error) => get_cached_skill(&connection, &id)?.ok_or(error),
     }
 }
 
 #[tauri::command]
 fn run_skill(
     app: AppHandle,
-    state: tauri::State<'_, ResearchProcessState>,
     id: String,
     inputs: serde_json::Value,
     active_document_id: Option<String>,
@@ -1742,31 +2045,70 @@ fn run_skill(
     let context_json = serde_json::to_string(&payload.context)
         .map_err(|error| format!("序列化技能上下文失败：{error}"))?;
 
-    let port = ensure_research_service(&app, &state)?;
-    let response = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(120))
-        .build()
-        .map_err(|error| format!("无法创建技能服务客户端：{error}"))?
-        .post(service_url(port, &format!("/skills/{id}/run")))
-        .json(&payload)
-        .send();
+    let skill = get_science_skill_from_vendor(&id).or_else(|_| {
+        get_cached_skill(&connection, &id)?.ok_or_else(|| "找不到这个科学技能。".to_string())
+    })?;
+    persist_skill_cache(&connection, &skill)?;
 
-    match response {
-        Ok(response) if response.status().is_success() => {
-            let service_response = response
-                .json::<RunSkillResponse>()
-                .map_err(|error| format!("解析技能运行响应失败：{error}"))?;
-            persist_skill_run(
-                &connection,
-                &service_response.run,
-                &inputs_json,
-                &context_json,
-            )?;
-            Ok(service_response.run)
-        }
-        Ok(response) => Err(extract_service_error(response)),
-        Err(error) => Err(format!("调用技能服务失败：{error}")),
+    let task = payload
+        .inputs
+        .get("task")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    let now = now_string();
+    let mut run = SkillRun {
+        id: Uuid::new_v4().to_string(),
+        skill_id: skill.id.clone(),
+        skill_name: skill.name.clone(),
+        status: "running".to_string(),
+        started_at: now,
+        finished_at: None,
+        error: None,
+        logs: vec![make_skill_log("info", "技能运行已进入受控 dry-run。")],
+        outputs: Vec::new(),
+    };
+
+    if task.is_empty() {
+        run.status = "failed".to_string();
+        run.finished_at = Some(now_string());
+        run.error = Some("任务上下文不能为空。".to_string());
+        run.logs
+            .push(make_skill_log("error", "任务上下文不能为空。"));
+    } else if skill.status != "可用" {
+        let message = match skill.status.as_str() {
+            "缺少依赖" => "该技能缺少本地依赖。请先安装 uv 或按技能说明补齐依赖。".to_string(),
+            "需要配置" => format!(
+                "该技能需要先配置环境变量：{}。",
+                skill.required_env.join("、")
+            ),
+            _ => "该技能当前不可用。".to_string(),
+        };
+        run.status = "failed".to_string();
+        run.finished_at = Some(now_string());
+        run.error = Some(message.clone());
+        run.logs.push(make_skill_log("error", &message));
+    } else {
+        run.outputs.push(SkillRunOutput {
+            id: Uuid::new_v4().to_string(),
+            kind: "markdown".to_string(),
+            title: "技能 dry-run 执行计划".to_string(),
+            content: build_skill_dry_run_output(
+                &skill,
+                &payload.inputs,
+                payload.context.active_document_id.as_deref(),
+                payload.context.active_document_path.as_deref(),
+            ),
+            file_path: None,
+        });
+        run.status = "succeeded".to_string();
+        run.finished_at = Some(now_string());
+        run.logs
+            .push(make_skill_log("info", "技能 dry-run 已完成。"));
     }
+
+    persist_skill_run(&connection, &run, &inputs_json, &context_json)?;
+    Ok(run)
 }
 
 #[tauri::command]

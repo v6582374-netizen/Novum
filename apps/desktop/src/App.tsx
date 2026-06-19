@@ -392,7 +392,7 @@ function App() {
   const [zoom, setZoom] = useState(100)
   const [pdfDocument, setPdfDocument] = useState<PDFDocumentProxy | null>(null)
   const [isLoadingLibrary, setIsLoadingLibrary] = useState(true)
-  const [isLoadingSkills, setIsLoadingSkills] = useState(true)
+  const [isLoadingSkills, setIsLoadingSkills] = useState(false)
   const [isImporting, setIsImporting] = useState(false)
   const [isLoadingPdf, setIsLoadingPdf] = useState(false)
   const [isRunningSkill, setIsRunningSkill] = useState(false)
@@ -585,8 +585,10 @@ function App() {
   }, [loadDocuments])
 
   useEffect(() => {
-    void Promise.resolve().then(() => loadSkills())
-  }, [loadSkills])
+    if ((activePanel === 'skills' || isCommandOpen) && !skills.length && !isLoadingSkills) {
+      void Promise.resolve().then(() => loadSkills())
+    }
+  }, [activePanel, isCommandOpen, isLoadingSkills, loadSkills, skills.length])
 
   useEffect(() => {
     async function loadProviderSettings() {
@@ -847,6 +849,12 @@ function App() {
   }
 
   async function importDevelopmentApiKey() {
+    if (providerForm.provider !== 'test-relay') {
+      setProviderOperationMessage('本机测试密钥仅用于测试中转站。')
+      setMessage('DeepSeek 官方和 OpenAI-compatible 请单独输入并保存 API Key。')
+      return
+    }
+
     setIsImportingProviderKey(true)
     setError(null)
     setProviderOperationMessage('正在查找内置/本机测试密钥。')
@@ -1270,25 +1278,35 @@ function App() {
           <div className="skill-list">
             {isLoadingSkills ? (
               <div className="empty-state compact">正在读取技能注册表...</div>
-            ) : filteredSkills.length ? (
-              filteredSkills.map((skill) => (
-                <button
-                  className={`skill-row ${skill.id === selectedSkill?.id ? 'selected' : ''}`}
-                  key={skill.id}
-                  type="button"
-                  onClick={() => selectSkill(skill)}
-                >
-                  <span>
-                    <strong>{skill.name}</strong>
-                    <small>
-                      {skill.domain} | {skill.status} | {skill.executionMode}
-                    </small>
-                  </span>
-                  <ChevronRight size={15} aria-hidden="true" />
-                </button>
-              ))
+            ) : skills.length ? (
+              filteredSkills.length ? (
+                filteredSkills.map((skill) => (
+                  <button
+                    className={`skill-row ${skill.id === selectedSkill?.id ? 'selected' : ''}`}
+                    key={skill.id}
+                    type="button"
+                    onClick={() => selectSkill(skill)}
+                  >
+                    <span>
+                      <strong>{skill.name}</strong>
+                      <small>
+                        {skill.domain} | {skill.status} | {skill.executionMode}
+                      </small>
+                    </span>
+                    <ChevronRight size={15} aria-hidden="true" />
+                  </button>
+                ))
+              ) : (
+                <div className="empty-state compact">没有找到匹配技能。</div>
+              )
             ) : (
-              <div className="empty-state compact">没有找到匹配技能。</div>
+              <button
+                className="empty-state compact"
+                type="button"
+                onClick={() => void loadSkills()}
+              >
+                点击载入科学技能。
+              </button>
             )}
           </div>
         </section>
@@ -1539,7 +1557,9 @@ function App() {
                     <span>{preset.description}</span>
                     <small>
                       {preset.model}
-                      {preset.hasDevelopmentKey ? ' | 本机密钥可用' : ''}
+                      {preset.provider === 'test-relay' && preset.hasDevelopmentKey
+                        ? ' | 本机测试密钥可用'
+                        : ''}
                     </small>
                   </button>
                 ))}
@@ -1593,18 +1613,20 @@ function App() {
                   {isTestingProvider ? <Loader2 className="spin" size={15} aria-hidden="true" /> : <Sparkles size={15} aria-hidden="true" />}
                   测试连接
                 </button>
-                <button
-                  type="button"
-                  onClick={() => void importDevelopmentApiKey()}
-                  disabled={isImportingProviderKey}
-                >
-                  {isImportingProviderKey ? (
-                    <Loader2 className="spin" size={15} aria-hidden="true" />
-                  ) : (
-                    <Sparkles size={15} aria-hidden="true" />
-                  )}
-                  导入本机测试密钥
-                </button>
+                {providerForm.provider === 'test-relay' ? (
+                  <button
+                    type="button"
+                    onClick={() => void importDevelopmentApiKey()}
+                    disabled={isImportingProviderKey}
+                  >
+                    {isImportingProviderKey ? (
+                      <Loader2 className="spin" size={15} aria-hidden="true" />
+                    ) : (
+                      <Sparkles size={15} aria-hidden="true" />
+                    )}
+                    导入本机测试密钥
+                  </button>
+                ) : null}
               </div>
             </section>
           ) : null}
@@ -1620,6 +1642,11 @@ function App() {
                 placeholder="围绕当前文献提出一个可被来源支撑的问题"
                 onChange={(event) => setPaperQuestion(event.target.value)}
               />
+              {selectedDocument.status !== '已索引' ? (
+                <div className="dependency-note">
+                  PaperQA 问答依赖当前文献已完成索引；如果只是测试模型连通性，请在「模型配置」里使用「测试连接」。
+                </div>
+              ) : null}
               <div className="form-actions">
                 <button
                   type="button"
